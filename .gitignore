@@ -1,0 +1,27 @@
+# Compiler output
+contracts/out/
+contracts/cache/
+
+# Dependencies (managed via git submodule)
+contracts/lib/
+
+# Build artifacts
+*.abi
+*.bin
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Gas snapshots (regenerate with `forge snapshot`)
+contracts/.gas-snapshot

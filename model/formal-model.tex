@@ -1,0 +1,505 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+
+\title{Mutual Liquidity Lock: A Formal Game-Theoretic Model}
+\author{Working Draft}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+%% ============================================================
+%% 1. THE MLL GAME: FORMAL DEFINITION
+%% ============================================================
+
+\section{The MLL Game}
+
+\begin{definition}[MLL Game]
+The \textbf{Mutual Liquidity Lock (MLL) Game} is a discrete-time, infinite-horizon, two-player game $\Gamma = \langle \{A, B\}, \mathcal{A}, \mathcal{S}, u, \delta \rangle$ defined as follows.
+\end{definition}
+
+\subsection{Players and Time}
+
+Two players $i \in \{A, B\}$. Periods $t = 0, 1, 2, \ldots$ with common discount factor $\delta \in (0,1)$.
+
+\subsection{State Space}
+
+The game state at time $t$ is a tuple:
+\[
+\omega_t = (s_t^A, s_t^B, \beta_t, \kappa_t, \gamma_t, \phi_t)
+\]
+where:
+\begin{itemize}
+    \item $s_t^i \geq 0$: player $i$'s \textit{share} (claim on the pool), with total pool $P_t = s_t^A + s_t^B$
+    \item $\beta_t \in \{0, A, B\}$: bleeding target ($0$ = no bleeding active)
+    \item $\kappa_t \in \{0, 1, \ldots, 6\}$: Russian Roulette invocation counter
+    \item $\gamma_t \in \{0, 1, \ldots, \Theta\}$: cooldown timer ($\Theta = 10$ periods after RR invocation)
+    \item $\phi_t \in \{\texttt{active}, \texttt{frozen}, \texttt{exited}\}$: game phase
+\end{itemize}
+
+\textbf{Initial state:} $\omega_0 = (s_0, s_0, 0, 0, 0, \texttt{active})$ where $s_0 > 0$ is each player's initial deposit.
+
+\subsection{Action Space}
+
+When $\phi_t = \texttt{active}$ and $\gamma_t = 0$ (no cooldown), each player $i$ simultaneously chooses:
+\[
+a_t^i \in \mathcal{A} = \{D, S, R, E\}
+\]
+\begin{itemize}
+    \item $D$ (Deposit): contribute the agreed amount $d > 0$
+    \item $S$ (Skip): do not contribute
+    \item $R$ (Roulette): invoke the Russian Roulette mechanism
+    \item $E$ (Exit): propose peaceful dissolution
+\end{itemize}
+
+During cooldown ($\gamma_t > 0$): $\mathcal{A} = \{D, S\}$ only.
+
+When $\phi_t \in \{\texttt{frozen}, \texttt{exited}\}$: no actions available (terminal).
+
+\subsection{Transition Rules}
+
+\subsubsection{Yield Accrual}
+Every period (regardless of actions), yield accrues at rate $y > 0$:
+\[
+\tilde{s}_t^i = s_t^i \cdot (1 + y)
+\]
+All subsequent computations in period $t$ use $\tilde{s}_t^i$.
+
+\subsubsection{Deposit and Bleeding}
+
+Given action profile $(a_t^A, a_t^B)$:
+
+\textbf{Case 1: Both deposit} ($a_t^A = a_t^B = D$).
+\[
+s_{t+1}^i = \tilde{s}_t^i + d, \quad \beta_{t+1} = 0
+\]
+
+\textbf{Case 2: Player $i$ deposits, player $j$ skips} ($a_t^i = D, a_t^j = S$).
+
+Bleeding activates against $j$:
+\[
+\Delta_t = r \cdot \tilde{s}_t^j
+\]
+\[
+s_{t+1}^i = \tilde{s}_t^i + d + \Delta_t, \qquad s_{t+1}^j = \tilde{s}_t^j - \Delta_t = \tilde{s}_t^j(1 - r)
+\]
+\[
+\beta_{t+1} = j
+\]
+
+\textbf{Case 3: Both skip} ($a_t^A = a_t^B = S$).
+
+No bleeding transfer (symmetric default):
+\[
+s_{t+1}^i = \tilde{s}_t^i, \quad \beta_{t+1} = 0
+\]
+
+\begin{remark}
+If both skip simultaneously, there is no asymmetry to trigger directional bleeding.
+This creates a potential coordination problem analyzed in Section~\ref{sec:equilibrium}.
+\end{remark}
+
+\subsubsection{Peaceful Exit}
+
+If both players choose $E$: $\phi_{t+1} = \texttt{exited}$. Each player receives their current share:
+\[
+u_{\text{exit}}^i = \tilde{s}_t^i
+\]
+
+If only one player chooses $E$, the proposal is recorded but no transition occurs. If both choose $E$ in the same period, exit executes.
+
+\subsubsection{Russian Roulette Mechanism}
+\label{sec:rr-def}
+
+If any player chooses $R$ (and $\gamma_t = 0$):
+
+\begin{enumerate}
+    \item Counter increments: $\kappa_{t+1} = \kappa_t + 1$
+    \item \textbf{Trigger check}: With probability $p(\kappa_{t+1}) = \frac{1}{7 - \kappa_{t+1}}$, funds freeze:
+    \[
+    \phi_{t+1} = \texttt{frozen}
+    \]
+    With probability $1 - p(\kappa_{t+1})$, the game continues with cooldown:
+    \[
+    \gamma_{t+1} = \Theta
+    \]
+    \item Cooldown decrements each period: $\gamma_{t+1} = \max(\gamma_t - 1, 0)$
+\end{enumerate}
+
+The probability sequence:
+\[
+p(k) = \frac{1}{7-k} \quad \text{for } k \in \{1, 2, 3, 4, 5, 6\}
+\]
+
+\begin{center}
+\begin{tabular}{c|cccccc}
+$k$ (invocation) & 1 & 2 & 3 & 4 & 5 & 6 \\
+\hline
+$p(k)$ & $\frac{1}{6}$ & $\frac{1}{5}$ & $\frac{1}{4}$ & $\frac{1}{3}$ & $\frac{1}{2}$ & $1$ \\
+Cumulative & $\frac{1}{6}$ & $\frac{1}{3}$ & $\frac{1}{2}$ & $\frac{2}{3}$ & $\frac{5}{6}$ & $1$
+\end{tabular}
+\end{center}
+
+\begin{remark}
+This is equivalent to drawing without replacement from $\{1,2,3,4,5,6\}$.
+The ``hidden $N$'' in the original design is isomorphic to this formulation,
+but this version avoids the on-chain secrecy problem entirely: each invocation
+requests fresh randomness (e.g., Chainlink VRF) with the appropriate probability.
+\end{remark}
+
+\subsection{Terminal Payoffs}
+
+\subsubsection{Frozen Trust}
+When $\phi = \texttt{frozen}$, principal is permanently locked. Each player receives a perpetual yield stream:
+\[
+u_{\text{frozen}}^i = \frac{y \cdot P_{\text{freeze}}}{2} \cdot \frac{1}{1 - \delta}
+\]
+where $P_{\text{freeze}} = s_{\text{freeze}}^A + s_{\text{freeze}}^B$ is the pool at freeze time.
+
+Note: yield is split equally regardless of individual shares, as the ``frozen trust'' severs individual claims on principal. This is a design choice that maximizes the MAD deterrent.
+
+\subsubsection{Peaceful Exit}
+\[
+u_{\text{exit}}^i = s_{\text{exit}}^i
+\]
+Each player receives their accumulated share (including any bleeding transfers).
+
+\subsection{Per-Period Utility}
+
+For player $i$ in an active period:
+\[
+u_t^i = y \cdot s_t^i - d \cdot \mathbf{1}[a_t^i = D]
+\]
+
+The total discounted utility from the game:
+\[
+U^i = \sum_{t=0}^{T-1} \delta^t \cdot u_t^i + \delta^T \cdot u_{\text{terminal}}^i
+\]
+where $T$ is the (possibly infinite) time of game termination.
+
+
+%% ============================================================
+%% 2. EQUILIBRIUM ANALYSIS
+%% ============================================================
+
+\section{Equilibrium Analysis}
+\label{sec:equilibrium}
+
+\subsection{The Cooperation Strategy Profile}
+
+\begin{definition}[Cooperative Strategy $\sigma^*$]
+For each player $i$:
+\begin{enumerate}
+    \item Play $D$ in every period where $\phi = \texttt{active}$ and the opponent has played $D$ in all prior periods (or is within a grace period $G$ after a skip).
+    \item If opponent has played $S$ for more than $G$ consecutive periods, continue playing $D$ (collecting bleeding transfers).
+    \item If bleeding has continued for $T_R > G$ periods with no resumption, play $R$ (initiate Russian Roulette).
+    \item If opponent proposes $E$ and the pool split is acceptable (within threshold $\epsilon$ of proportional), play $E$.
+\end{enumerate}
+\end{definition}
+
+\subsection{Deviation Analysis: Skip vs. Deposit}
+
+\begin{theorem}[Cooperation Sustainability]
+\label{thm:cooperation}
+The cooperative strategy profile $\sigma^*$ constitutes a Subgame Perfect Equilibrium if and only if:
+\[
+\delta \geq \delta^* \equiv \frac{d}{d + r \cdot s_t^i}
+\]
+where $s_t^i$ is player $i$'s current share at the point of potential deviation.
+\end{theorem}
+
+\begin{proof}
+Consider player $B$'s incentive to deviate from $D$ to $S$ at time $t$, given that $A$ follows $\sigma^*$.
+
+\textbf{Payoff from cooperating} (continuing to play $D$):
+
+Starting from share $s = s_t^B$ with yield rate $y$, the per-period net payoff is $y \cdot s_t^B - d$ (yield minus deposit). Under mutual cooperation the share grows:
+\[
+V_{\text{coop}}(s) = \sum_{\tau=0}^{\infty} \delta^\tau \left[ y(s + \tau d)(1+y)^\tau - d \right]
+\]
+
+For tractability, consider the marginal deviation incentive. In a single period:
+\begin{itemize}
+    \item Cooperate: net flow $= y \cdot s - d$, continuation share $= (s+d)(1+y)$
+    \item Deviate (skip): net flow $= y \cdot s$, continuation share $= s(1+y)(1-r)$
+\end{itemize}
+
+The one-period gain from deviation: $+d$ (saved deposit).
+
+The one-period cost of deviation (bleeding): in the next period, share is reduced by $r \cdot s(1+y)$. This compounds: the present value of the bleeding loss over $\tau$ periods before resuming is:
+\[
+\text{PV}_{\text{bleed}} = \sum_{\tau=1}^{\infty} \delta^\tau \left[ r \cdot s \cdot (1+y)^\tau \cdot (1-r)^{\tau-1} \right]
+= \frac{\delta \cdot r \cdot s \cdot (1+y)}{1 - \delta(1+y)(1-r)}
+\]
+
+For deviation to be unprofitable:
+\[
+d \leq \frac{\delta \cdot r \cdot s \cdot (1+y)}{1 - \delta(1+y)(1-r)}
+\]
+
+When $y$ is small relative to $r$ and $\delta$, this simplifies to approximately:
+\[
+\delta \geq \frac{d}{d + r \cdot s}
+\]
+
+As $s$ grows over time (due to cumulative deposits), the RHS decreases, making cooperation \textit{easier} to sustain as the pool matures. $\qed$
+\end{proof}
+
+\begin{corollary}[Pool Maturity Effect]
+The critical discount factor $\delta^*$ is decreasing in the pool size $P_t$. Thus, the MLL becomes more stable over time: the longer parties have cooperated, the harder it is to justify deviation.
+\end{corollary}
+
+\begin{remark}[Numerical Example]
+With $d = 100$, $s = 10000$ (after several years of deposits), $r = 0.15$ (monthly bleeding, corresponding to $\approx 0.5\%$/day):
+\[
+\delta^* = \frac{100}{100 + 0.15 \times 10000} = \frac{100}{1600} = 0.0625
+\]
+Even extremely impatient agents (those who discount the future at 93.75\%) would find cooperation rational. The mechanism becomes very robust with accumulated stakes.
+\end{remark}
+
+
+\subsection{Russian Roulette Subgame Analysis}
+\label{sec:rr-analysis}
+
+When a player invokes Russian Roulette, we enter a finite extensive-form subgame. Let $V_{\text{RR}}^i(k)$ denote player $i$'s expected value when the counter is at $k$ and it is some player's turn to decide whether to invoke again (after cooldown).
+
+\begin{definition}[Russian Roulette Subgame]
+After invocation $k$ does not trigger ($k < 6$), both players enter a $\Theta$-period cooldown. At the end of cooldown, the game returns to the normal action space. At this point, either:
+\begin{enumerate}
+    \item Both resume cooperation (play $D$): the game returns to the normal repeated game.
+    \item One or both skip: bleeding dynamics apply.
+    \item Either player invokes $R$ again: counter goes to $k+1$.
+    \item Both propose exit: peaceful dissolution.
+\end{enumerate}
+\end{definition}
+
+\begin{proposition}[RR as Bargaining Catalyst]
+\label{prop:rr-bargain}
+In the Russian Roulette subgame with counter $\kappa = k$, if both players are risk-averse (concave utility over wealth), there exists a peaceful exit split $(\alpha, 1-\alpha)$ that both players prefer to continuing the RR process, provided:
+\[
+\frac{1}{7-k} > \frac{|s^A - s^B|}{P} \cdot c
+\]
+where $c$ is a constant depending on the curvature of the utility function.
+\end{proposition}
+
+\textit{Intuition}: As the trigger probability $p(k)$ increases with each invocation, the expected cost of continued brinkmanship rises. Risk-averse players will eventually prefer \textit{any} reasonable split to gambling on fund freeze. The key insight is that RR does not need to actually trigger to be effective --- the escalating probability drives convergence to a negotiated exit.
+
+\begin{proposition}[RR Deterrence Threshold]
+\label{prop:rr-deterrence}
+A player will refrain from invoking Russian Roulette if and only if:
+\[
+V_{\text{status quo}}^i \geq (1 - p(k+1)) \cdot V_{\text{RR}}^i(k+1) + p(k+1) \cdot u_{\text{frozen}}^i
+\]
+where $V_{\text{status quo}}^i$ is the continuation value of the current (possibly bleeding) state.
+\end{proposition}
+
+\begin{remark}[When Does a Player Invoke RR?]
+A player invokes RR when the status quo is sufficiently bad --- i.e., when bleeding has eroded their share enough that the gamble on fund freeze (which resets to equal yield sharing) becomes preferable. Specifically, if player $B$ is bleeding, $B$ invokes RR when:
+\[
+\frac{s_t^B}{P_t} < \frac{y}{2(1-\delta)} \cdot \frac{p(k+1)}{V_{\text{status quo}}^B}
+\]
+This creates a natural ``floor'' on how far bleeding can go before triggering escalation.
+\end{remark}
+
+
+%% ============================================================
+%% 3. MECHANISM PROPERTIES
+%% ============================================================
+
+\section{Mechanism Properties}
+
+\subsection{Individual Rationality}
+
+\begin{theorem}[Ex-Ante Individual Rationality]
+\label{thm:ir}
+Participation in MLL is individually rational if:
+\[
+\frac{y \cdot s_0}{1 - \delta} - \frac{d}{1-\delta} + \frac{y \cdot d}{(1-\delta)^2} > s_0
+\]
+where the LHS is the expected discounted payoff from cooperation and the RHS is the outside option (keeping $s_0$).
+\end{theorem}
+
+\begin{proof}
+Under mutual cooperation, player $i$'s share at time $t$ is:
+\[
+s_t^i = (s_0 + d \cdot t)(1+y)^t \approx s_0(1+y)^t + d \sum_{\tau=0}^{t-1}(1+y)^\tau
+\]
+
+The present value of yield minus deposits:
+\[
+V_{\text{coop}} = \sum_{t=0}^{\infty} \delta^t \left[ y \cdot s_t^i - d \right]
+\]
+
+For $V_{\text{coop}} > s_0$ (participation is better than autarky), we need the DeFi yield on the growing pool to compensate for the illiquidity cost. The condition simplifies to:
+\[
+y > (1 - \delta) \cdot \frac{d}{s_0 + \frac{d}{1-\delta}}
+\]
+
+With reasonable parameters ($\delta = 0.99$, $d = 100$, $s_0 = 1000$, $y = 0.005$ per period), this is satisfied. The yield on the locked pool must exceed the opportunity cost of illiquidity. $\qed$
+\end{proof}
+
+\subsection{Incentive Compatibility}
+
+\begin{theorem}[Dominant Strategy in Mature Pool]
+\label{thm:ic}
+When $P_t$ is sufficiently large (specifically, when $r \cdot s_t^i > d / \delta$), playing $D$ is a dominant strategy regardless of the opponent's action.
+\end{theorem}
+
+\begin{proof}
+If the opponent plays $D$: playing $D$ yields share growth of $d + y \cdot s_t^i$; playing $S$ yields share growth of $y \cdot s_t^i$ but triggers bleeding risk if opponent retaliates.
+
+If the opponent plays $S$: playing $D$ yields $d + y \cdot s_t^i + r \cdot s_t^j$ (deposit plus bleeding bonus); playing $S$ yields only $y \cdot s_t^i$ (no bleeding, no growth).
+
+In both cases, the gain from $D$ over $S$ is at least $d + r \cdot s_t^j - d = r \cdot s_t^j > 0$ when accounting for the bleeding transfer.
+
+More precisely, the net gain from playing $D$ vs. $S$ when the opponent plays $S$:
+\[
+\underbrace{r \cdot s_t^j}_{\text{bleeding bonus}} - \underbrace{d}_{\text{deposit cost}} + \underbrace{\delta \cdot r \cdot (s_t^i + d)(1+y)}_{\text{PV of avoiding being bled next period}}
+\]
+
+When $r \cdot s_t^j > d$ (pool share exceeds deposit), $D$ dominates $S$ even myopically. With discounting, the condition relaxes further. $\qed$
+\end{proof}
+
+\subsection{Renegotiation-Proofness}
+\label{sec:reneg}
+
+\begin{definition}[Renegotiation-Proofness]
+A strategy profile is \textit{renegotiation-proof} if there is no period $t$ and no alternative continuation strategy profile that both players strictly prefer to the prescribed continuation.
+\end{definition}
+
+\begin{proposition}[Conditional Renegotiation-Proofness]
+\label{prop:reneg}
+The cooperative equilibrium $\sigma^*$ is renegotiation-proof if and only if in every punishment phase (bleeding), the punishing player weakly prefers to continue punishment over any mutually beneficial renegotiation.
+\end{proposition}
+
+\textit{Analysis}: This is the most subtle property. Consider the situation where $B$ has defaulted and is bleeding. Both players know that:
+\begin{enumerate}
+    \item $A$ is gaining: $A$ receives bleeding transfers and would prefer this to continue.
+    \item $B$ is losing: $B$ would prefer to renegotiate.
+    \item If they renegotiate to peaceful exit, $A$ still gets a favorable split (due to accumulated bleeding transfers).
+\end{enumerate}
+
+The key question is whether $A$ prefers continued bleeding or immediate exit. If $A$'s continuation value from bleeding exceeds the exit value, $A$ will refuse renegotiation, making the punishment self-enforcing.
+
+\[
+A \text{ refuses renegotiation} \iff \sum_{\tau=1}^{\infty} \delta^\tau \cdot r \cdot s_t^B (1-r)^{\tau-1}(1+y)^\tau > 0
+\]
+
+This is \textit{always} satisfied when $s_t^B > 0$ and $r < 1$. Therefore:
+
+\begin{corollary}
+The bleeding punishment is inherently renegotiation-proof from the punisher's perspective: the punishing player always prefers to continue collecting bleeding transfers over stopping. The threat of Russian Roulette by the punished party serves as the only constraint on indefinite bleeding.
+\end{corollary}
+
+This creates a natural dynamic equilibrium: bleeding continues until the punished party's threat of Russian Roulette becomes credible enough to induce negotiation. The ``negotiation zone'' emerges endogenously.
+
+
+%% ============================================================
+%% 4. PARAMETER CALIBRATION
+%% ============================================================
+
+\section{Parameter Calibration}
+
+\subsection{Bleeding Rate $r$}
+
+The bleeding rate must satisfy three constraints simultaneously:
+
+\begin{enumerate}
+    \item \textbf{Deterrence}: $r$ must be high enough that the expected cost of skipping exceeds the deposit amount:
+    \[
+    r > \frac{d(1-\delta)}{s_t^i \cdot \delta}
+    \]
+
+    \item \textbf{Recovery allowance}: $r$ must be low enough that a temporarily incapacitated player can recover meaningful share:
+    \[
+    (1-r)^{G} > \alpha_{\min}
+    \]
+    where $G$ is the grace period (in periods) and $\alpha_{\min}$ is the minimum acceptable share retention (e.g., 80\%).
+
+    \item \textbf{RR trigger calibration}: $r$ should be calibrated so that the punished party's RR invocation threshold is reached after a meaningful but not excessive number of periods:
+    \[
+    T_{\text{RR}} = \frac{\ln(\theta_{\text{RR}})}{\ln(1-r)} \quad \text{periods until RR becomes rational}
+    \]
+    where $\theta_{\text{RR}}$ is the share ratio at which RR invocation becomes the best response.
+\end{enumerate}
+
+\begin{proposition}[Optimal Bleeding Rate]
+For the baseline parameterization ($d = 100$, $s_0 = 1000$, $\delta = 0.99$, $y = 0.005$), the optimal bleeding rate lies in:
+\[
+r^* \in [0.003, 0.008] \text{ per day} \quad \Leftrightarrow \quad [0.09, 0.22] \text{ per month}
+\]
+
+The original design's $r = 0.005$/day ($\approx 0.14$/month) falls within this range.
+\end{proposition}
+
+
+\subsection{Russian Roulette Probability Sequence}
+
+\begin{proposition}[Optimality of the $1/(7-k)$ Sequence]
+The probability sequence $p(k) = 1/(7-k)$ for $k \in \{1,\ldots,6\}$ is equivalent to sampling without replacement from a uniform distribution on $\{1,\ldots,6\}$. This has two desirable properties:
+\begin{enumerate}
+    \item \textbf{Uniform marginal}: each invocation is equally likely to be the ``fatal'' one ex ante ($\Pr[\text{trigger at exactly invocation } k] = 1/6$ for all $k$).
+    \item \textbf{Monotone hazard rate}: $p(k)$ is strictly increasing in $k$, ensuring escalation pressure mounts with each invocation.
+\end{enumerate}
+\end{proposition}
+
+\begin{remark}[Design Alternative: Geometric Distribution]
+An alternative would be i.i.d. draws with fixed probability $p$ each round (geometric distribution). This has a constant hazard rate, which means escalation pressure does not increase. The without-replacement design is strictly preferable for brinkmanship because it guarantees termination in finite time and creates accelerating urgency.
+\end{remark}
+
+
+%% ============================================================
+%% 5. EXTENSIONS AND OPEN QUESTIONS
+%% ============================================================
+
+\section{Extensions and Open Questions}
+
+\subsection{Asymmetric Deposits}
+
+When players have different incomes, equal deposits create asymmetric exit costs. Let $w^A, w^B$ be incomes with $w^A > w^B$. With equal deposit $d$:
+\[
+\text{Relative cost: } \frac{d}{w^A} < \frac{d}{w^B}
+\]
+
+Player $B$ faces higher relative exit cost. This can be addressed by:
+\begin{enumerate}
+    \item \textbf{Proportional deposits}: $d^i = \alpha \cdot w^i$ (requires income verification --- difficult on-chain)
+    \item \textbf{TCP discovery}: the exploratory protocol described in the original design
+    \item \textbf{Endogenous asymmetry}: allow different deposit amounts; adjust bleeding rates proportionally to maintain symmetric incentives
+\end{enumerate}
+
+\subsection{Multi-Party Extension (M-of-N)}
+
+Extending to $N > 2$ players with $M$-of-$N$ signing threshold introduces:
+\begin{itemize}
+    \item Coalition formation: subsets of players may collude
+    \item Voting on exit: majority vs. unanimity
+    \item Directed bleeding: who bleeds when one player defaults?
+\end{itemize}
+
+This connects to the broader mechanism design literature on team production (Holmstr\"om, 1982) and requires a separate treatment.
+
+\subsection{Dead Man's Switch}
+
+To address the key liveness concern (one party losing access to their key), define:
+\begin{definition}[Dead Man's Switch]
+If player $i$ fails to interact with the contract for $T_{\text{dead}}$ consecutive periods, player $j$ gains unilateral withdrawal rights over the entire pool.
+\end{definition}
+
+The parameter $T_{\text{dead}}$ must be set large enough to avoid false triggers but small enough to be practically useful. Suggested range: $T_{\text{dead}} \in [60, 180]$ days.
+
+\subsection{Smart Contract Completeness vs. Real-World Incompleteness}
+
+MLL is a \textit{complete} contract in the Hart-Moore sense: all state transitions are deterministically specified by the code. This avoids the renegotiation problem of incomplete contracts (Hart \& Moore, 1988) but creates rigidity. The ``escape valve'' is the peaceful exit mechanism, which requires bilateral agreement but allows any arbitrary wealth transfer between parties.
+
+
+\end{document}
