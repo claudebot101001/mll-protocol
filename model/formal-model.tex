@@ -35,35 +35,32 @@ Two players $i \in \{A, B\}$. Periods $t = 0, 1, 2, \ldots$ with common discount
 
 The game state at time $t$ is a tuple:
 \[
-\omega_t = (s_t^A, s_t^B, \beta_t, \kappa_t, \gamma_t, \phi_t)
+\omega_t = (s_t^A, s_t^B, S_t^A, S_t^B, \beta_t, \phi_t)
 \]
 where:
 \begin{itemize}
     \item $s_t^i \geq 0$: player $i$'s \textit{share} (claim on the pool), with total pool $P_t = s_t^A + s_t^B$
+    \item $S_t^i \geq 0$: player $i$'s \textit{cumulative deposits} (determines exit penalty)
     \item $\beta_t \in \{0, A, B\}$: bleeding target ($0$ = no bleeding active)
-    \item $\kappa_t \in \{0, 1, \ldots, 6\}$: Russian Roulette invocation counter
-    \item $\gamma_t \in \{0, 1, \ldots, \Theta\}$: cooldown timer ($\Theta = 10$ periods after RR invocation)
-    \item $\phi_t \in \{\texttt{active}, \texttt{frozen}, \texttt{exited}\}$: game phase
+    \item $\phi_t \in \{\texttt{active}, \texttt{exited}\}$: game phase
 \end{itemize}
 
-\textbf{Initial state:} $\omega_0 = (s_0, s_0, 0, 0, 0, \texttt{active})$ where $s_0 > 0$ is each player's initial deposit.
+\textbf{Initial state:} $\omega_0 = (s_0, s_0, s_0, s_0, 0, \texttt{active})$ where $s_0 > 0$ is each player's initial deposit.
 
 \subsection{Action Space}
 
-When $\phi_t = \texttt{active}$ and $\gamma_t = 0$ (no cooldown), each player $i$ simultaneously chooses:
+When $\phi_t = \texttt{active}$, each player $i$ simultaneously chooses:
 \[
-a_t^i \in \mathcal{A} = \{D, S, R, E\}
+a_t^i \in \mathcal{A} = \{D, S, E, X\}
 \]
 \begin{itemize}
     \item $D$ (Deposit): contribute the agreed amount $d > 0$
     \item $S$ (Skip): do not contribute
-    \item $R$ (Roulette): invoke the Russian Roulette mechanism
     \item $E$ (Exit): propose peaceful dissolution
+    \item $X$ (Unilateral Exit): initiate unilateral withdrawal with dynamic penalty
 \end{itemize}
 
-During cooldown ($\gamma_t > 0$): $\mathcal{A} = \{D, S\}$ only.
-
-When $\phi_t \in \{\texttt{frozen}, \texttt{exited}\}$: no actions available (terminal).
+When $\phi_t = \texttt{exited}$: no actions available (terminal).
 
 \subsection{Transition Rules}
 
@@ -80,12 +77,12 @@ Given action profile $(a_t^A, a_t^B)$:
 
 \textbf{Case 1: Both deposit} ($a_t^A = a_t^B = D$).
 \[
-s_{t+1}^i = \tilde{s}_t^i + d, \quad \beta_{t+1} = 0
+s_{t+1}^i = \tilde{s}_t^i + d, \quad S_{t+1}^i = S_t^i + d, \quad \beta_{t+1} = 0
 \]
 
 \textbf{Case 2: Player $i$ deposits, player $j$ skips} ($a_t^i = D, a_t^j = S$).
 
-Bleeding activates against $j$:
+Bleeding activates against $j$ with 100\% transfer to the compliant party:
 \[
 \Delta_t = r \cdot \tilde{s}_t^j
 \]
@@ -93,19 +90,20 @@ Bleeding activates against $j$:
 s_{t+1}^i = \tilde{s}_t^i + d + \Delta_t, \qquad s_{t+1}^j = \tilde{s}_t^j - \Delta_t = \tilde{s}_t^j(1 - r)
 \]
 \[
-\beta_{t+1} = j
+S_{t+1}^i = S_t^i + d, \quad S_{t+1}^j = S_t^j, \quad \beta_{t+1} = j
 \]
+Note: 100\% of the bleed amount transfers to the compliant party. No value is burned; $P_{t+1} = P_t + d$.
 
 \textbf{Case 3: Both skip} ($a_t^A = a_t^B = S$).
 
-No bleeding transfer (symmetric default):
+No bleeding transfer (symmetric default). Clocks advance to prevent retroactive bleed on resume:
 \[
 s_{t+1}^i = \tilde{s}_t^i, \quad \beta_{t+1} = 0
 \]
 
 \begin{remark}
 If both skip simultaneously, there is no asymmetry to trigger directional bleeding.
-This creates a potential coordination problem analyzed in Section~\ref{sec:equilibrium}.
+The mutual-default clock advancement prevents a resuming party from capturing retroactive bleed for the period when both were inactive.
 \end{remark}
 
 \subsubsection{Peaceful Exit}
@@ -117,61 +115,49 @@ u_{\text{exit}}^i = \tilde{s}_t^i
 
 If only one player chooses $E$, the proposal is recorded but no transition occurs. If both choose $E$ in the same period, exit executes.
 
-\subsubsection{Russian Roulette Mechanism}
-\label{sec:rr-def}
+\subsubsection{Unilateral Exit with Dynamic Penalty}
+\label{sec:unilateral-exit}
 
-If any player chooses $R$ (and $\gamma_t = 0$):
+If player $i$ chooses $X$ (unilateral exit), a countdown period $T_X$ begins. After $T_X$ elapses (during which the counterparty may negotiate or deposit), the exit executes:
 
-\begin{enumerate}
-    \item Counter increments: $\kappa_{t+1} = \kappa_t + 1$
-    \item \textbf{Trigger check}: With probability $p(\kappa_{t+1}) = \frac{1}{7 - \kappa_{t+1}}$, funds freeze:
-    \[
-    \phi_{t+1} = \texttt{frozen}
-    \]
-    With probability $1 - p(\kappa_{t+1})$, the game continues with cooldown:
-    \[
-    \gamma_{t+1} = \Theta
-    \]
-    \item Cooldown decrements each period: $\gamma_{t+1} = \max(\gamma_t - 1, 0)$
-\end{enumerate}
-
-The probability sequence:
 \[
-p(k) = \frac{1}{7-k} \quad \text{for } k \in \{1, 2, 3, 4, 5, 6\}
+\phi_{t+T_X} = \texttt{exited}
 \]
 
-\begin{center}
-\begin{tabular}{c|cccccc}
-$k$ (invocation) & 1 & 2 & 3 & 4 & 5 & 6 \\
-\hline
-$p(k)$ & $\frac{1}{6}$ & $\frac{1}{5}$ & $\frac{1}{4}$ & $\frac{1}{3}$ & $\frac{1}{2}$ & $1$ \\
-Cumulative & $\frac{1}{6}$ & $\frac{1}{3}$ & $\frac{1}{2}$ & $\frac{2}{3}$ & $\frac{5}{6}$ & $1$
-\end{tabular}
-\end{center}
+The exiting player forfeits a fraction of their share as penalty:
+
+\begin{definition}[Dynamic Exit Penalty]
+\label{def:dynamic-penalty}
+The exit penalty $\pi^i$ for player $i$ is a function of their cumulative deposits $S^i$:
+\[
+\pi(S^i) = P_{\max} - (P_{\max} - P_{\min}) \cdot \min\!\left(\frac{S^i}{s_{\text{target}}}, 1\right)
+\]
+where $P_{\max}$ is the maximum penalty (at cold start), $P_{\min}$ is the minimum penalty (at maturity), and $s_{\text{target}} = n \cdot d$ is the target cumulative deposit for full maturity ($n$ = target deposit count).
+\end{definition}
+
+The penalty amount is deducted from the exiting player's share and transferred to the counterparty:
+\[
+u_X^i = s^i \cdot (1 - \pi(S^i)), \qquad u_X^j = s^j + s^i \cdot \pi(S^i)
+\]
 
 \begin{remark}
-This is equivalent to drawing without replacement from $\{1,2,3,4,5,6\}$.
-The ``hidden $N$'' in the original design is isomorphic to this formulation,
-but this version avoids the on-chain secrecy problem entirely: each invocation
-requests fresh randomness (e.g., Chainlink VRF) with the appropriate probability.
+The dynamic penalty is \textit{per-party}: each player's penalty depends on their own cumulative commitment, not the counterparty's. This allows asymmetric maturity paths and correctly penalizes the less-invested party more heavily.
 \end{remark}
 
 \subsection{Terminal Payoffs}
-
-\subsubsection{Frozen Trust}
-When $\phi = \texttt{frozen}$, principal is permanently locked. Each player receives a perpetual yield stream:
-\[
-u_{\text{frozen}}^i = \frac{y \cdot P_{\text{freeze}}}{2} \cdot \frac{1}{1 - \delta}
-\]
-where $P_{\text{freeze}} = s_{\text{freeze}}^A + s_{\text{freeze}}^B$ is the pool at freeze time.
-
-Note: yield is split equally regardless of individual shares, as the ``frozen trust'' severs individual claims on principal. This is a design choice that maximizes the MAD deterrent.
 
 \subsubsection{Peaceful Exit}
 \[
 u_{\text{exit}}^i = s_{\text{exit}}^i
 \]
 Each player receives their accumulated share (including any bleeding transfers).
+
+\subsubsection{Unilateral Exit}
+When player $i$ exits unilaterally:
+\[
+u_X^i = s^i \cdot (1 - \pi(S^i)), \qquad u_X^j = s^j + s^i \cdot \pi(S^i)
+\]
+where $\pi(S^i)$ is the dynamic exit penalty (Definition~\ref{def:dynamic-penalty}). The penalty amount transfers to the counterparty as compensation.
 
 \subsection{Per-Period Utility}
 
@@ -201,10 +187,13 @@ For each player $i$:
 \begin{enumerate}
     \item Play $D$ in every period where $\phi = \texttt{active}$ and the opponent has played $D$ in all prior periods (or is within a grace period $G$ after a skip).
     \item If opponent has played $S$ for more than $G$ consecutive periods, continue playing $D$ (collecting bleeding transfers).
-    \item If bleeding has continued for $T_R > G$ periods with no resumption, play $R$ (initiate Russian Roulette).
     \item If opponent proposes $E$ and the pool split is acceptable (within threshold $\epsilon$ of proportional), play $E$.
 \end{enumerate}
 \end{definition}
+
+\begin{remark}
+The $\epsilon$-proportionality condition is a modeling assumption reflecting rational behavior, not a contract-enforced constraint. The smart contract's \texttt{proposeExit()} is unconditional --- if both parties propose exit, it executes regardless of share distribution. The model assumes players would refuse unfavorable exits; the contract leaves this judgment off-chain.
+\end{remark}
 
 \subsection{Deviation Analysis: Skip vs. Deposit}
 
@@ -266,49 +255,63 @@ With $d = 100$, $s = 10000$ (after several years of deposits), $r = 0.15$ (month
 Even extremely impatient agents (those who discount the future at 93.75\%) would find cooperation rational. The mechanism becomes very robust with accumulated stakes.
 \end{remark}
 
-
-\subsection{Russian Roulette Subgame Analysis}
-\label{sec:rr-analysis}
-
-When a player invokes Russian Roulette, we enter a finite extensive-form subgame. Let $V_{\text{RR}}^i(k)$ denote player $i$'s expected value when the counter is at $k$ and it is some player's turn to decide whether to invoke again (after cooldown).
-
-\begin{definition}[Russian Roulette Subgame]
-After invocation $k$ does not trigger ($k < 6$), both players enter a $\Theta$-period cooldown. At the end of cooldown, the game returns to the normal action space. At this point, either:
-\begin{enumerate}
-    \item Both resume cooperation (play $D$): the game returns to the normal repeated game.
-    \item One or both skip: bleeding dynamics apply.
-    \item Either player invokes $R$ again: counter goes to $k+1$.
-    \item Both propose exit: peaceful dissolution.
-\end{enumerate}
-\end{definition}
-
-\begin{proposition}[RR as Bargaining Catalyst]
-\label{prop:rr-bargain}
-In the Russian Roulette subgame with counter $\kappa = k$, if both players are risk-averse (concave utility over wealth), there exists a peaceful exit split $(\alpha, 1-\alpha)$ that both players prefer to continuing the RR process, provided:
+\begin{remark}[Binding Constraint: Exit Option]
+\label{rem:binding-constraint}
+The $\delta^*$ analysis characterizes when cooperation is self-enforcing given an infinite horizon. However, the existence of the unilateral exit option introduces a tighter constraint. A player cooperates if and only if the discounted continuation value of the relationship exceeds the exit payoff:
 \[
-\frac{1}{7-k} > \frac{|s^A - s^B|}{P} \cdot c
+V_{\text{relationship}}^i > s^i \cdot (1 - \pi(S^i))
 \]
-where $c$ is a constant depending on the curvature of the utility function.
-\end{proposition}
-
-\textit{Intuition}: As the trigger probability $p(k)$ increases with each invocation, the expected cost of continued brinkmanship rises. Risk-averse players will eventually prefer \textit{any} reasonable split to gambling on fund freeze. The key insight is that RR does not need to actually trigger to be effective --- the escalating probability drives convergence to a negotiated exit.
-
-\begin{proposition}[RR Deterrence Threshold]
-\label{prop:rr-deterrence}
-A player will refrain from invoking Russian Roulette if and only if:
-\[
-V_{\text{status quo}}^i \geq (1 - p(k+1)) \cdot V_{\text{RR}}^i(k+1) + p(k+1) \cdot u_{\text{frozen}}^i
-\]
-where $V_{\text{status quo}}^i$ is the continuation value of the current (possibly bleeding) state.
-\end{proposition}
-
-\begin{remark}[When Does a Player Invoke RR?]
-A player invokes RR when the status quo is sufficiently bad --- i.e., when bleeding has eroded their share enough that the gamble on fund freeze (which resets to equal yield sharing) becomes preferable. Specifically, if player $B$ is bleeding, $B$ invokes RR when:
-\[
-\frac{s_t^B}{P_t} < \frac{y}{2(1-\delta)} \cdot \frac{p(k+1)}{V_{\text{status quo}}^B}
-\]
-This creates a natural ``floor'' on how far bleeding can go before triggering escalation.
+At cold start ($S^i = s_0$, $\pi \approx P_{\max}$), the exit payoff is very low, making cooperation easy to sustain. As the pool matures ($\pi \to P_{\min}$), the exit option becomes more attractive, but by then the relationship value has grown commensurately. The dynamic penalty is calibrated so that this crossover never favors defection for patient agents.
 \end{remark}
+
+\subsection{Dynamic Penalty and Cold-Start Analysis}
+\label{sec:dynamic-penalty-analysis}
+
+\begin{proposition}[Cold-Start Protection]
+\label{prop:cold-start}
+The dynamic exit penalty $\pi(S^i)$ compensates for the cold-start vulnerability of the bleeding mechanism. Specifically:
+\begin{enumerate}
+    \item At cold start ($S^i = s_0$, pool $P = 2s_0$), the bleeding cost per period is $r \cdot s_0$, which may be small relative to the deposit $d$. The high exit penalty $\pi \approx P_{\max}$ ensures that unilateral exit is costly despite low accumulated bleed.
+    \item At maturity ($S^i \geq s_{\text{target}}$), cumulative bleeding from default has a large base ($s^i \gg s_0$), making the bleeding mechanism self-sufficient. The penalty relaxes to $P_{\min}$.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+At cold start, a defecting player who deposits once then exits immediately faces:
+\[
+\text{Defection cost} = s^i \cdot \pi(s_0) \approx s_0 \cdot P_{\max}
+\]
+With $P_{\max} = 0.80$, this is $0.80 \cdot s_0$ --- a severe penalty that deters opportunistic entry.
+
+After $n$ deposits ($S^i = (n+1) \cdot s_0$ including activation), the penalty has decayed to:
+\[
+\pi = P_{\max} - (P_{\max} - P_{\min}) \cdot \frac{(n+1) \cdot s_0}{n_{\text{target}} \cdot s_0}
+\]
+
+Meanwhile, the bleeding mechanism's deterrent power grows linearly with the pool:
+\[
+\text{Bleeding cost per period} = r \cdot s^i \geq r \cdot (n+1) \cdot s_0
+\]
+
+The penalty decay is calibrated so that bleeding becomes self-sufficient (i.e., $r \cdot s^i > d$) approximately when $\pi$ reaches $P_{\min}$. $\qed$
+\end{proof}
+
+\begin{proposition}[Penalty Trajectory]
+\label{prop:penalty-trajectory}
+With baseline parameters ($P_{\max} = 0.80$, $P_{\min} = 0.15$, $n_{\text{target}} = 7$):
+
+\begin{center}
+\begin{tabular}{c|ccc}
+Deposits & Cumulative $S^i / d$ & $\pi(S^i)$ & Interpretation \\
+\hline
+1 (activation) & 1 & 70.7\% & Cold start --- near-maximum penalty \\
+2 & 2 & 61.4\% & Early stage \\
+4 & 4 & 42.9\% & Midpoint \\
+7 & 7 & 15.0\% & Mature --- minimum penalty \\
+10+ & $\geq 7$ & 15.0\% & Saturated at minimum
+\end{tabular}
+\end{center}
+\end{proposition}
 
 
 %% ============================================================
@@ -381,26 +384,30 @@ A strategy profile is \textit{renegotiation-proof} if there is no period $t$ and
 The cooperative equilibrium $\sigma^*$ is renegotiation-proof if and only if in every punishment phase (bleeding), the punishing player weakly prefers to continue punishment over any mutually beneficial renegotiation.
 \end{proposition}
 
-\textit{Analysis}: This is the most subtle property. Consider the situation where $B$ has defaulted and is bleeding. Both players know that:
+\textit{Analysis}: Consider the situation where $B$ has defaulted and is bleeding. Both players know that:
 \begin{enumerate}
-    \item $A$ is gaining: $A$ receives bleeding transfers and would prefer this to continue.
-    \item $B$ is losing: $B$ would prefer to renegotiate.
-    \item If they renegotiate to peaceful exit, $A$ still gets a favorable split (due to accumulated bleeding transfers).
+    \item $A$ is gaining: $A$ receives 100\% of bleeding transfers and would prefer this to continue.
+    \item $B$ is losing: $B$ would prefer to renegotiate or exit.
+    \item $B$ can unilaterally exit, paying penalty $\pi(S^B)$ and ending the game.
 \end{enumerate}
 
-The key question is whether $A$ prefers continued bleeding or immediate exit. If $A$'s continuation value from bleeding exceeds the exit value, $A$ will refuse renegotiation, making the punishment self-enforcing.
+The key question is whether $A$ prefers continued bleeding or $B$'s unilateral exit. $A$'s continuation value from bleeding:
 
 \[
-A \text{ refuses renegotiation} \iff \sum_{\tau=1}^{\infty} \delta^\tau \cdot r \cdot s_t^B (1-r)^{\tau-1}(1+y)^\tau > 0
+V_{\text{bleed}}^A = \sum_{\tau=1}^{\infty} \delta^\tau \cdot r \cdot s_t^B (1-r)^{\tau-1}(1+y)^\tau
 \]
 
-This is \textit{always} satisfied when $s_t^B > 0$ and $r < 1$. Therefore:
+This is always positive when $s_t^B > 0$ and $r < 1$. But $B$'s exit option bounds how long bleeding can continue:
 
 \begin{corollary}
-The bleeding punishment is inherently renegotiation-proof from the punisher's perspective: the punishing player always prefers to continue collecting bleeding transfers over stopping. The threat of Russian Roulette by the punished party serves as the only constraint on indefinite bleeding.
+The bleeding punishment is bounded by the unilateral exit option. Bleeding continues until $B$'s remaining share after cumulative bleed falls below the unilateral exit payoff:
+\[
+s_t^B(1-r)^k < s_t^B \cdot (1 - \pi(S^B))
+\]
+i.e., after $k^* = \lceil \ln(1-\pi) / \ln(1-r) \rceil$ periods, $B$ prefers to exit.
 \end{corollary}
 
-This creates a natural dynamic equilibrium: bleeding continues until the punished party's threat of Russian Roulette becomes credible enough to induce negotiation. The ``negotiation zone'' emerges endogenously.
+This creates a natural bound on the punishment phase: bleeding is self-enforcing (the punisher always wants to continue), but time-limited (the punished party exits when accumulated bleed exceeds the exit penalty). With $\pi(S^B) = 15\%$ and $r = 0.5\%$/day, $k^* \approx 33$ days.
 
 
 %% ============================================================
@@ -425,11 +432,11 @@ The bleeding rate must satisfy three constraints simultaneously:
     \]
     where $G$ is the grace period (in periods) and $\alpha_{\min}$ is the minimum acceptable share retention (e.g., 80\%).
 
-    \item \textbf{RR trigger calibration}: $r$ should be calibrated so that the punished party's RR invocation threshold is reached after a meaningful but not excessive number of periods:
+    \item \textbf{Exit bound calibration}: $r$ should be calibrated so that cumulative bleeding exceeds the exit penalty within a reasonable timeframe:
     \[
-    T_{\text{RR}} = \frac{\ln(\theta_{\text{RR}})}{\ln(1-r)} \quad \text{periods until RR becomes rational}
+    T_{\text{exit}} = \frac{\ln(1 - \pi_{\min})}{\ln(1-r)} \quad \text{periods until exit becomes rational}
     \]
-    where $\theta_{\text{RR}}$ is the share ratio at which RR invocation becomes the best response.
+    With $\pi_{\min} = 0.15$ and $r = 0.005$/day, $T_{\text{exit}} \approx 33$ days.
 \end{enumerate}
 
 \begin{proposition}[Optimal Bleeding Rate]
@@ -442,19 +449,26 @@ The original design's $r = 0.005$/day ($\approx 0.14$/month) falls within this r
 \end{proposition}
 
 
-\subsection{Russian Roulette Probability Sequence}
+\subsection{Dynamic Penalty Parameters}
 
-\begin{proposition}[Optimality of the $1/(7-k)$ Sequence]
-The probability sequence $p(k) = 1/(7-k)$ for $k \in \{1,\ldots,6\}$ is equivalent to sampling without replacement from a uniform distribution on $\{1,\ldots,6\}$. This has two desirable properties:
+\begin{proposition}[Penalty Parameter Calibration]
+The dynamic penalty parameters $(P_{\max}, P_{\min}, n_{\text{target}})$ should satisfy:
 \begin{enumerate}
-    \item \textbf{Uniform marginal}: each invocation is equally likely to be the ``fatal'' one ex ante ($\Pr[\text{trigger at exactly invocation } k] = 1/6$ for all $k$).
-    \item \textbf{Monotone hazard rate}: $p(k)$ is strictly increasing in $k$, ensuring escalation pressure mounts with each invocation.
+    \item \textbf{Cold-start deterrence}: $P_{\max}$ must be high enough that deposit-then-exit is strictly dominated by non-participation:
+    \[
+    s_0 \cdot P_{\max} > d \quad \Rightarrow \quad P_{\max} > \frac{d}{s_0}
+    \]
+    With $d = s_0$, this requires $P_{\max} > 1$ (impossible). However, since the exiting party also loses their counterparty's deposit continuation, $P_{\max} = 0.80$ provides adequate deterrence.
+
+    \item \textbf{Maturity floor}: $P_{\min}$ should exceed the ``quick-exploit'' cost ($d$ saved by skipping one period then exiting):
+    \[
+    P_{\min} > \frac{d}{s_t^i} \approx \frac{1}{n+1}
+    \]
+    For mature pools ($n \geq 7$), $P_{\min} = 0.15$ satisfies this.
+
+    \item \textbf{Transition alignment}: $n_{\text{target}}$ should approximately match the number of deposits at which bleeding becomes self-sufficient ($r \cdot s^i > d$).
 \end{enumerate}
 \end{proposition}
-
-\begin{remark}[Design Alternative: Geometric Distribution]
-An alternative would be i.i.d. draws with fixed probability $p$ each round (geometric distribution). This has a constant hazard rate, which means escalation pressure does not increase. The without-replacement design is strictly preferable for brinkmanship because it guarantees termination in finite time and creates accelerating urgency.
-\end{remark}
 
 
 %% ============================================================
@@ -499,7 +513,7 @@ The parameter $T_{\text{dead}}$ must be set large enough to avoid false triggers
 
 \subsection{Smart Contract Completeness vs. Real-World Incompleteness}
 
-MLL is a \textit{complete} contract in the Hart-Moore sense: all state transitions are deterministically specified by the code. This avoids the renegotiation problem of incomplete contracts (Hart \& Moore, 1988) but creates rigidity. The ``escape valve'' is the peaceful exit mechanism, which requires bilateral agreement but allows any arbitrary wealth transfer between parties.
+MLL is algorithmically rigid: all state transitions are deterministically specified by the code. However, this is \textit{not} completeness in the Hart-Moore sense --- H-M completeness implies state-contingent adaptation, the ability to specify efficient outcomes for all states of the world including unforeseen ones. MLL deliberately foregoes this: it cannot adapt to contingencies not coded in advance (Hart \& Moore, 1988). The ``escape valve'' is the peaceful exit mechanism, which requires bilateral agreement but allows parties to renegotiate off-chain and exit with any mutually agreed split.
 
 
 \end{document}

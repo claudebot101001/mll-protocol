@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {RussianRoulette} from "./RussianRoulette.sol";
-
 /// @title Mutual Liquidity Lock (MLL)
-/// @notice Bilateral commitment device with bleeding penalty, Russian Roulette, and multi-path exit
-/// @dev Implements: share gate, 70/30 bleed split, unilateral exit, configurable freeze, decaying bleed rate
-///      Uses pull-based withdrawals to prevent DoS by contract parties
+/// @notice Bilateral commitment device with bleeding penalty, dynamic exit penalty, and multi-path exit
+/// @dev Implements: 100% bleed transfer, dynamic exit penalty (cold-start high → mature low),
+///      pull-based withdrawals, dead man's switch abandonment
 
-contract MutualLiquidityLock is RussianRoulette {
+contract MutualLiquidityLock {
 
     // ============================================================
     //                         TYPES
     // ============================================================
 
-    enum Phase { Inactive, Active, Frozen, Exited }
+    enum Phase { Inactive, Active, Exited }
 
     struct Agreement {
         address partyA;
         address partyB;
         uint256 depositAmount;       // agreed deposit per period (wei)
         uint256 depositInterval;     // seconds between required deposits
-        uint256 bleedRatePerDay;     // basis points per day at steady state (e.g., 50 = 0.5%)
+        uint256 bleedRatePerDay;     // basis points per day (e.g., 50 = 0.5%)
         uint256 gracePeriodsAllowed; // missed periods before bleeding starts
-        uint256 freezeDuration;      // seconds funds remain locked after RR trigger (default 10 years)
-        uint256 exitPenaltyBps;      // unilateral exit penalty in bps (e.g., 1500 = 15%)
+        uint256 exitPenaltyMaxBps;   // max exit penalty in bps (cold-start, e.g., 8000 = 80%)
+        uint256 exitPenaltyMinBps;   // min exit penalty in bps (mature, e.g., 1500 = 15%)
+        uint256 penaltyDecayTarget;  // deposit-count multiplier for penalty to reach min
         uint256 exitCountdown;       // seconds of countdown for unilateral exit (e.g., 30 days)
         Phase phase;
         uint256 createdAt;
@@ -33,6 +32,7 @@ contract MutualLiquidityLock is RussianRoulette {
 
     struct PartyState {
         uint256 share;               // current claim on pool (wei)
+        uint256 totalDeposited;      // cumulative deposits (for dynamic penalty calculation)
         uint256 lastDepositTime;     // timestamp of last deposit
         uint256 lastBleedApplied;    // timestamp up to which bleeding has been applied
         uint256 missedPeriods;       // consecutive missed deposit periods
@@ -49,11 +49,6 @@ contract MutualLiquidityLock is RussianRoulette {
     //                        CONSTANTS
     // ============================================================
 
-    uint256 public constant SHARE_GATE_BPS = 3500;       // 35% minimum share to invoke RR
-    uint256 public constant BLEED_COUNTERPARTY_BPS = 7000; // 70% of bleed goes to counterparty
-    uint256 public constant BLEED_BURN_BPS = 3000;         // 30% of bleed is permanently burned
-    uint256 public constant WARMUP_PERIODS = 3;            // RR blocked for first 3 deposit intervals
-    uint256 public constant DECAY_PERIODS = 6;             // bleeding rate decays from 2x to 1x over 6 intervals
     uint256 public constant MAX_DEPOSIT_MULTIPLIER = 3;    // max deposit = 3x agreed amount per tx
     uint256 public constant ABANDONMENT_MIN_DAYS = 90 days;
     uint256 public constant ABANDONMENT_MIN_INTERVALS = 3; // at least 3 missed intervals for abandonment
@@ -66,7 +61,6 @@ contract MutualLiquidityLock is RussianRoulette {
     mapping(address => PartyState) public parties;
     mapping(address => uint256) public claimable;  // pull-based withdrawal balances
     UnilateralExit public pendingExit;
-    uint256 public frozenAt;         // timestamp when pool was frozen (0 if not frozen)
 
     // ============================================================
     //                         EVENTS
@@ -74,16 +68,14 @@ contract MutualLiquidityLock is RussianRoulette {
 
     event AgreementCreated(address indexed partyA, address indexed partyB, uint256 depositAmount, uint256 interval);
     event Deposited(address indexed party, uint256 amount, uint256 newShare);
-    event BleedingApplied(address indexed from, address indexed to, uint256 toAmount, uint256 burnedAmount);
+    event BleedingApplied(address indexed from, address indexed to, uint256 amount);
     event ExitProposed(address indexed party);
     event ExitProposalCancelled(address indexed party);
     event PeacefulExit(uint256 shareA, uint256 shareB);
     event AgreementActivated(uint256 activatedAt);
-    event AgreementFrozen(uint256 totalPool, uint256 invocationCount, uint256 unfreezeAt);
     event UnilateralExitInitiated(address indexed initiator, uint256 executeAfter);
     event UnilateralExitCancelled(address indexed canceller);
     event UnilateralExitExecuted(address indexed initiator, uint256 received, uint256 penaltyPaid);
-    event FrozenFundsReleased(uint256 shareA, uint256 shareB);
     event AbandonedClaimed(address indexed claimer, uint256 amount);
     event InactiveCancelled(address indexed party, uint256 refund);
     event Withdrawn(address indexed party, uint256 amount);
@@ -94,12 +86,9 @@ contract MutualLiquidityLock is RussianRoulette {
 
     error NotParty();
     error WrongPhase(Phase expected, Phase actual);
-    error WarmupPeriodActive(uint256 endsAt);
-    error ShareBelowGate(uint256 shareBps, uint256 requiredBps);
     error ExitCountdownNotElapsed(uint256 executeAfter);
     error NoActiveUnilateralExit();
     error UnilateralExitAlreadyActive();
-    error FreezeNotExpired(uint256 unfreezeAt);
     error NothingToWithdraw();
 
     // ============================================================
@@ -126,15 +115,21 @@ contract MutualLiquidityLock is RussianRoulette {
     /// @param _partyB Address of the counterparty
     /// @param _depositAmount Required deposit per period in wei
     /// @param _depositInterval Seconds between required deposits (e.g., 30 days = 2592000)
-    /// @param _bleedRateBpsPerDay Steady-state bleeding rate in bps/day (e.g., 50 = 0.5%/day)
+    /// @param _bleedRateBpsPerDay Bleeding rate in bps/day (e.g., 50 = 0.5%/day)
     /// @param _gracePeriods Number of missed periods before bleeding activates
+    /// @param _exitPenaltyMaxBps Maximum exit penalty in bps (cold-start, e.g., 8000 = 80%)
+    /// @param _exitPenaltyMinBps Minimum exit penalty in bps (mature, e.g., 1500 = 15%)
+    /// @param _penaltyDecayTarget Number of deposits for penalty to reach minimum
     constructor(
         address _partyA,
         address _partyB,
         uint256 _depositAmount,
         uint256 _depositInterval,
         uint256 _bleedRateBpsPerDay,
-        uint256 _gracePeriods
+        uint256 _gracePeriods,
+        uint256 _exitPenaltyMaxBps,
+        uint256 _exitPenaltyMinBps,
+        uint256 _penaltyDecayTarget
     ) {
         require(_partyA != address(0), "Invalid partyA");
         require(_partyB != address(0) && _partyB != _partyA, "Invalid partyB");
@@ -142,6 +137,9 @@ contract MutualLiquidityLock is RussianRoulette {
         require(_depositInterval >= 1 minutes, "Interval too short");
         require(_bleedRateBpsPerDay > 0 && _bleedRateBpsPerDay <= 1000, "Bleed rate out of range");
         require(_gracePeriods <= 12, "Too many grace periods");
+        require(_exitPenaltyMaxBps <= 10000, "Max penalty > 100%");
+        require(_exitPenaltyMinBps <= _exitPenaltyMaxBps, "Min > Max penalty");
+        require(_penaltyDecayTarget > 0, "Decay target must be > 0");
 
         agreement = Agreement({
             partyA: _partyA,
@@ -150,9 +148,10 @@ contract MutualLiquidityLock is RussianRoulette {
             depositInterval: _depositInterval,
             bleedRatePerDay: _bleedRateBpsPerDay,
             gracePeriodsAllowed: _gracePeriods,
-            freezeDuration: 3650 days,      // 10 years default
-            exitPenaltyBps: 1500,           // 15% default
-            exitCountdown: 30 days,         // 30 days default
+            exitPenaltyMaxBps: _exitPenaltyMaxBps,
+            exitPenaltyMinBps: _exitPenaltyMinBps,
+            penaltyDecayTarget: _penaltyDecayTarget,
+            exitCountdown: 30 days,
             phase: Phase.Inactive,
             createdAt: block.timestamp,
             activatedAt: 0
@@ -172,17 +171,15 @@ contract MutualLiquidityLock is RussianRoulette {
         require(ps.share == 0, "Already deposited");
 
         ps.share = msg.value;
+        ps.totalDeposited = msg.value;
         ps.lastDepositTime = block.timestamp;
         ps.lastBleedApplied = block.timestamp;
 
         address other = _otherParty(msg.sender);
         if (parties[other].share > 0) {
-            // Both parties have deposited — activate the agreement
             agreement.phase = Phase.Active;
             agreement.activatedAt = block.timestamp;
 
-            // Reset first activator's clocks to activation time
-            // This prevents charging them for time spent waiting in Inactive
             PartyState storage otherPs = parties[other];
             otherPs.lastDepositTime = block.timestamp;
             otherPs.lastBleedApplied = block.timestamp;
@@ -221,6 +218,7 @@ contract MutualLiquidityLock is RussianRoulette {
 
         PartyState storage ps = parties[msg.sender];
         ps.share += msg.value;
+        ps.totalDeposited += msg.value;
         ps.lastDepositTime = block.timestamp;
         ps.lastBleedApplied = block.timestamp;
         ps.missedPeriods = 0;
@@ -258,7 +256,7 @@ contract MutualLiquidityLock is RussianRoulette {
         _applyBleedingFor(agreement.partyB, agreement.partyA);
     }
 
-    /// @dev Apply bleeding with 70/30 split and decaying rate
+    /// @dev Apply bleeding: 100% of bleed amount transfers to compliant party
     function _applyBleedingFor(address defaulter, address compliant) internal {
         PartyState storage dps = parties[defaulter];
         PartyState storage cps = parties[compliant];
@@ -268,10 +266,13 @@ contract MutualLiquidityLock is RussianRoulette {
 
         if (periodsMissed <= agreement.gracePeriodsAllowed) return;
 
-        // No directional bleed if both are defaulting
+        // No directional bleed if both are defaulting — but advance clock to prevent retroactive bleed on resume
         uint256 otherElapsed = block.timestamp - cps.lastDepositTime;
         uint256 otherMissed = otherElapsed / agreement.depositInterval;
-        if (otherMissed > agreement.gracePeriodsAllowed) return;
+        if (otherMissed > agreement.gracePeriodsAllowed) {
+            dps.lastBleedApplied = block.timestamp;
+            return;
+        }
 
         // Incremental bleeding
         uint256 graceEnd = dps.lastDepositTime + agreement.gracePeriodsAllowed * agreement.depositInterval;
@@ -282,44 +283,20 @@ contract MutualLiquidityLock is RussianRoulette {
         uint256 newBleedDays = (block.timestamp - bleedStart) / 1 days;
         if (newBleedDays == 0) return;
 
-        uint256 effectiveRate = _getEffectiveBleedRate();
-
-        uint256 remainingBps = 10000 - effectiveRate;
+        uint256 remainingBps = 10000 - agreement.bleedRatePerDay;
         uint256 retainedFraction = _compoundBps(remainingBps, newBleedDays);
 
         uint256 bleedAmount = dps.share - (dps.share * retainedFraction / 1e18);
 
         if (bleedAmount > 0 && bleedAmount <= dps.share) {
             dps.share -= bleedAmount;
-
-            uint256 toCounterparty = bleedAmount * BLEED_COUNTERPARTY_BPS / 10000;
-            // remainder is permanently burned (stays in contract, never attributed)
-
-            cps.share += toCounterparty;
+            cps.share += bleedAmount;
 
             dps.missedPeriods = periodsMissed - agreement.gracePeriodsAllowed;
             dps.lastBleedApplied = bleedStart + newBleedDays * 1 days;
 
-            emit BleedingApplied(defaulter, compliant, toCounterparty, bleedAmount - toCounterparty);
+            emit BleedingApplied(defaulter, compliant, bleedAmount);
         }
-    }
-
-    /// @dev Returns the effective bleeding rate, accounting for early-period decay
-    /// Uses activatedAt as the reference point, not createdAt
-    function _getEffectiveBleedRate() internal view returns (uint256) {
-        uint256 age = block.timestamp - agreement.activatedAt;
-        uint256 decayEnd = DECAY_PERIODS * agreement.depositInterval;
-
-        if (age >= decayEnd) {
-            return agreement.bleedRatePerDay;
-        }
-
-        uint256 multiplierX1e18 = (2 * decayEnd - age) * 1e18 / decayEnd;
-        uint256 effectiveRate = agreement.bleedRatePerDay * multiplierX1e18 / 1e18;
-
-        if (effectiveRate > 1000) effectiveRate = 1000;
-
-        return effectiveRate;
     }
 
     function _compoundBps(uint256 bps, uint256 n) internal pure returns (uint256) {
@@ -337,67 +314,6 @@ contract MutualLiquidityLock is RussianRoulette {
         }
 
         return result;
-    }
-
-    // ============================================================
-    //                    RUSSIAN ROULETTE
-    // ============================================================
-
-    /// @notice Invoke RR. Requires: past warmup, deposit d, and >= 35% pool share.
-    /// Warmup is anchored to activatedAt, not createdAt
-    function invokeRoulette() external payable onlyParty inPhase(Phase.Active) {
-        uint256 warmupEnd = agreement.activatedAt + WARMUP_PERIODS * agreement.depositInterval;
-        if (block.timestamp <= warmupEnd)
-            revert WarmupPeriodActive(warmupEnd);
-
-        require(msg.value >= agreement.depositAmount, "Must deposit to invoke RR");
-        require(msg.value <= agreement.depositAmount * MAX_DEPOSIT_MULTIPLIER, "Exceeds max deposit");
-
-        _applyBleeding();
-
-        PartyState storage ps = parties[msg.sender];
-        ps.share += msg.value;
-        ps.lastDepositTime = block.timestamp;
-        ps.lastBleedApplied = block.timestamp;
-
-        uint256 totalPool = parties[agreement.partyA].share + parties[agreement.partyB].share;
-        uint256 invokerShareBps = ps.share * 10000 / totalPool;
-        if (invokerShareBps < SHARE_GATE_BPS)
-            revert ShareBelowGate(invokerShareBps, SHARE_GATE_BPS);
-
-        bool triggered = _invokeRR(msg.sender);
-
-        if (triggered) {
-            _freezePool();
-        }
-    }
-
-    function _freezePool() internal {
-        agreement.phase = Phase.Frozen;
-        frozenAt = block.timestamp;
-        uint256 total = parties[agreement.partyA].share + parties[agreement.partyB].share;
-        uint256 unfreezeAt = block.timestamp + agreement.freezeDuration;
-        emit AgreementFrozen(total, rrState.invocationCount, unfreezeAt);
-    }
-
-    /// @notice After freeze duration expires, either party can release funds
-    function releaseFrozenFunds() external onlyParty inPhase(Phase.Frozen) {
-        uint256 unfreezeAt = frozenAt + agreement.freezeDuration;
-        if (block.timestamp < unfreezeAt)
-            revert FreezeNotExpired(unfreezeAt);
-
-        agreement.phase = Phase.Exited;
-
-        uint256 shareA = parties[agreement.partyA].share;
-        uint256 shareB = parties[agreement.partyB].share;
-
-        parties[agreement.partyA].share = 0;
-        parties[agreement.partyB].share = 0;
-
-        emit FrozenFundsReleased(shareA, shareB);
-
-        claimable[agreement.partyA] += shareA;
-        claimable[agreement.partyB] += shareB;
     }
 
     // ============================================================
@@ -425,7 +341,6 @@ contract MutualLiquidityLock is RussianRoulette {
     function _executePeacefulExit() internal {
         agreement.phase = Phase.Exited;
 
-        // Clear any pending unilateral exit
         if (pendingExit.active) {
             delete pendingExit;
         }
@@ -446,7 +361,6 @@ contract MutualLiquidityLock is RussianRoulette {
     //                    UNILATERAL EXIT
     // ============================================================
 
-    /// @notice Initiate unilateral exit with countdown period.
     function initiateUnilateralExit() external onlyParty inPhase(Phase.Active) {
         if (pendingExit.active) revert UnilateralExitAlreadyActive();
 
@@ -462,7 +376,6 @@ contract MutualLiquidityLock is RussianRoulette {
         emit UnilateralExitInitiated(msg.sender, executeAfter);
     }
 
-    /// @notice Cancel a pending unilateral exit (only the initiator can cancel)
     function cancelUnilateralExit() external onlyParty inPhase(Phase.Active) {
         if (!pendingExit.active) revert NoActiveUnilateralExit();
         require(msg.sender == pendingExit.initiator, "Only initiator can cancel");
@@ -471,8 +384,7 @@ contract MutualLiquidityLock is RussianRoulette {
         emit UnilateralExitCancelled(msg.sender);
     }
 
-    /// @notice Execute unilateral exit after countdown. Either party can execute.
-    /// The initiator pays a percentage penalty from their share to the counterparty.
+    /// @notice Execute unilateral exit after countdown. Dynamic penalty applied.
     function executeUnilateralExit() external onlyParty inPhase(Phase.Active) {
         if (!pendingExit.active) revert NoActiveUnilateralExit();
         if (block.timestamp < pendingExit.executeAfter)
@@ -486,7 +398,8 @@ contract MutualLiquidityLock is RussianRoulette {
         PartyState storage ips = parties[initiator];
         PartyState storage ops = parties[other];
 
-        uint256 penalty = ips.share * agreement.exitPenaltyBps / 10000;
+        uint256 penaltyBps = _getExitPenalty(initiator);
+        uint256 penalty = ips.share * penaltyBps / 10000;
         ips.share -= penalty;
         ops.share += penalty;
 
@@ -506,18 +419,34 @@ contract MutualLiquidityLock is RussianRoulette {
     }
 
     // ============================================================
+    //                    DYNAMIC EXIT PENALTY
+    // ============================================================
+
+    /// @notice Calculate exit penalty based on cumulative deposits.
+    /// penalty(s) = P_max - (P_max - P_min) * min(totalDeposited / (target * depositAmount), 1)
+    /// Early exit = high penalty (up to P_max). Mature pool = low penalty (P_min).
+    function _getExitPenalty(address party) internal view returns (uint256) {
+        uint256 totalDep = parties[party].totalDeposited;
+        uint256 target = agreement.penaltyDecayTarget * agreement.depositAmount;
+
+        if (totalDep >= target) {
+            return agreement.exitPenaltyMinBps;
+        }
+
+        uint256 range = agreement.exitPenaltyMaxBps - agreement.exitPenaltyMinBps;
+        return agreement.exitPenaltyMaxBps - (range * totalDep / target);
+    }
+
+    // ============================================================
     //                    DEAD MAN'S SWITCH
     // ============================================================
 
     /// @notice Claim funds when counterparty has been inactive for an extended period.
-    /// Requires: counterparty inactive for max(90 days, 3 * depositInterval),
-    /// AND claimer must have deposited more recently than the counterparty.
     function claimAbandoned() external onlyParty inPhase(Phase.Active) {
         address other = _otherParty(msg.sender);
         PartyState storage otherPs = parties[other];
         PartyState storage myPs = parties[msg.sender];
 
-        // Abandonment threshold is the greater of 90 days or 3 deposit intervals
         uint256 abandonmentThreshold = ABANDONMENT_MIN_DAYS;
         uint256 intervalThreshold = ABANDONMENT_MIN_INTERVALS * agreement.depositInterval;
         if (intervalThreshold > abandonmentThreshold) {
@@ -536,6 +465,10 @@ contract MutualLiquidityLock is RussianRoulette {
         _applyBleeding();
 
         agreement.phase = Phase.Exited;
+
+        if (pendingExit.active) {
+            delete pendingExit;
+        }
 
         uint256 total = parties[agreement.partyA].share + parties[agreement.partyB].share;
         parties[agreement.partyA].share = 0;
@@ -567,13 +500,8 @@ contract MutualLiquidityLock is RussianRoulette {
         return elapsed / agreement.depositInterval;
     }
 
-    function getEffectiveBleedRate() external view returns (uint256) {
-        return _getEffectiveBleedRate();
-    }
-
-    function getUnfreezeTime() external view returns (uint256) {
-        if (agreement.phase != Phase.Frozen) return 0;
-        return frozenAt + agreement.freezeDuration;
+    function getExitPenalty(address party) external view returns (uint256) {
+        return _getExitPenalty(party);
     }
 
     // ============================================================

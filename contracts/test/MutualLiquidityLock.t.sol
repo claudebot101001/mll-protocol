@@ -13,7 +13,9 @@ contract MutualLiquidityLockTest is Test {
     uint256 constant INTERVAL = 30 days;
     uint256 constant BLEED_RATE = 50; // 0.5% per day in bps
     uint256 constant GRACE = 1; // 1 missed period grace
-    uint256 constant DECAY_PERIODS = 6;
+    uint256 constant EXIT_PENALTY_MAX = 8000; // 80%
+    uint256 constant EXIT_PENALTY_MIN = 1500; // 15%
+    uint256 constant PENALTY_DECAY_TARGET = 7; // 7 deposits to reach min penalty
 
     // Track timestamp explicitly because via_ir optimizer caches block.timestamp
     uint256 internal ts = 1; // Foundry default
@@ -28,7 +30,10 @@ contract MutualLiquidityLockTest is Test {
         vm.deal(bob, 100 ether);
 
         vm.prank(alice);
-        mll = new MutualLiquidityLock(alice, bob, DEPOSIT, INTERVAL, BLEED_RATE, GRACE);
+        mll = new MutualLiquidityLock(
+            alice, bob, DEPOSIT, INTERVAL, BLEED_RATE, GRACE,
+            EXIT_PENALTY_MAX, EXIT_PENALTY_MIN, PENALTY_DECAY_TARGET
+        );
     }
 
     // ============================================================
@@ -117,17 +122,22 @@ contract MutualLiquidityLockTest is Test {
     function test_BleedingActivatesAfterGracePeriod() public {
         _activateBothParties();
 
+        // Mutual default period — both miss deposits
         _warp(2 * INTERVAL);
-
         vm.prank(alice);
         mll.deposit{value: DEPOSIT}();
 
-        mll.applyBleeding();
+        // Warp INTERVAL (not 2x) so Alice has periodsMissed=1 (<=grace), still compliant
+        // Bob continues defaulting → his bleed window opens from Alice's resume point
+        _warp(INTERVAL);
+        vm.prank(alice);
+        mll.deposit{value: DEPOSIT}();
 
         (uint256 shareA, uint256 shareB, , ) = mll.getPoolState();
         assertLt(shareB, DEPOSIT, "Bob's share should decrease");
-        assertGt(shareA, 2 * DEPOSIT, "Alice should gain from bleeding");
-        assertLt(shareA + shareB, 3 * DEPOSIT, "Some value burned");
+        assertGt(shareA, 3 * DEPOSIT, "Alice should gain from bleeding");
+        // 100% transfer: total pool value preserved
+        assertEq(shareA + shareB, 4 * DEPOSIT, "No value burned, total preserved");
     }
 
     function test_NoBleedingWhenBothDefault() public {
@@ -142,22 +152,45 @@ contract MutualLiquidityLockTest is Test {
         assertEq(shareB, DEPOSIT, "No bleeding when both default");
     }
 
-    function test_BleedSplitIs70_30() public {
+    function test_NoRetroactiveBleedAfterMutualDefault() public {
         _activateBothParties();
 
-        // Warp past decay period so rate is steady
-        _warpPastDecay();
+        // Both default for 3 intervals (past grace)
+        _warp(3 * INTERVAL);
 
-        // Record state before bleeding
-        (, uint256 bobBefore, , ) = mll.getPoolState();
+        // Apply bleeding — both are defaulting, so no bleed should occur
+        mll.applyBleeding();
+        (uint256 shareA, uint256 shareB, , ) = mll.getPoolState();
+        assertEq(shareA, DEPOSIT, "No bleeding during mutual default");
+        assertEq(shareB, DEPOSIT, "No bleeding during mutual default");
 
-        // Bob defaults for 2 intervals past grace
-        _warp(2 * INTERVAL);
+        // Alice resumes — deposits again
         vm.prank(alice);
         mll.deposit{value: DEPOSIT}();
 
-        // Record alice's share before bleeding applied in this call
-        (uint256 aliceBefore, , , ) = mll.getPoolState();
+        // Apply bleeding — Bob is now the sole defaulter, but should NOT be back-charged
+        // for the mutual-default period. Only bleed from Alice's resume point onward.
+        mll.applyBleeding();
+
+        (, uint256 shareB2, , ) = mll.getPoolState();
+        // Bob should still have his full DEPOSIT (no retroactive bleed for mutual-default period)
+        // The bleed clock was advanced during mutual default, so only new default time counts
+        assertEq(shareB2, DEPOSIT, "No retroactive bleed after mutual default");
+    }
+
+    function test_Bleed100PercentToCompliant() public {
+        _activateBothParties();
+
+        // Mutual default period — both miss deposits
+        _warp(3 * INTERVAL);
+        vm.prank(alice);
+        mll.deposit{value: DEPOSIT}();
+
+        // Warp INTERVAL so Alice stays compliant (periodsMissed=1 <= grace)
+        // Bob continues defaulting → bleed applies
+        _warp(INTERVAL);
+
+        (uint256 aliceBefore, uint256 bobBefore, , ) = mll.getPoolState();
 
         mll.applyBleeding();
 
@@ -166,22 +199,8 @@ contract MutualLiquidityLockTest is Test {
         uint256 aliceGained = shareA - aliceBefore;
 
         assertGt(bobLost, 0, "Bob lost share to bleeding");
-        assertGt(aliceGained, 0, "Alice gained from bleeding");
-        assertGt(aliceGained * 10000 / bobLost, 6500, "Alice gets ~70%");
-        assertLt(aliceGained * 10000 / bobLost, 7500, "Alice gets ~70%");
-        assertGt(address(mll).balance, total, "Contract holds burned tokens");
-    }
-
-    function test_DecayingBleedRateHigherInitially() public {
-        _activateBothParties();
-
-        uint256 initialRate = mll.getEffectiveBleedRate();
-        assertGt(initialRate, BLEED_RATE, "Initial rate should be > steady state");
-        assertLe(initialRate, BLEED_RATE * 2, "Initial rate should be <= 2x steady state");
-
-        _warp(DECAY_PERIODS * INTERVAL);
-        uint256 steadyRate = mll.getEffectiveBleedRate();
-        assertEq(steadyRate, BLEED_RATE, "Should reach steady state after decay period");
+        assertEq(aliceGained, bobLost, "100% of bleed goes to Alice (no burn)");
+        assertEq(total, aliceBefore + bobBefore, "Total pool unchanged (no burn)");
     }
 
     // ============================================================
@@ -206,11 +225,9 @@ contract MutualLiquidityLockTest is Test {
         (, , , phase) = mll.getPoolState();
         assertEq(uint256(phase), uint256(MutualLiquidityLock.Phase.Exited));
 
-        // Pull-based: funds are claimable, not auto-sent
         assertEq(mll.claimable(alice), DEPOSIT);
         assertEq(mll.claimable(bob), DEPOSIT);
 
-        // Withdraw
         vm.prank(alice);
         mll.withdraw();
         vm.prank(bob);
@@ -263,7 +280,7 @@ contract MutualLiquidityLockTest is Test {
         mll.executeUnilateralExit();
     }
 
-    function test_UnilateralExitExecutesWithPenalty() public {
+    function test_UnilateralExitExecutesWithDynamicPenalty() public {
         _activateBothParties();
 
         vm.prank(alice);
@@ -277,11 +294,13 @@ contract MutualLiquidityLockTest is Test {
         vm.prank(alice);
         mll.executeUnilateralExit();
 
-        // Pull-based: check claimable
         uint256 aliceClaimable = mll.claimable(alice);
         uint256 bobClaimable = mll.claimable(bob);
 
+        // At cold-start (1 deposit), penalty is high (~7072 bps)
+        // Alice's share = 1 DEPOSIT, penalty ≈ 70.7% of 1 ETH ≈ 0.707 ETH
         assertLt(aliceClaimable, DEPOSIT, "Alice receives less than deposit due to penalty");
+        assertLt(aliceClaimable, DEPOSIT * 4000 / 10000, "Cold-start penalty is much higher than 15%");
         assertGt(bobClaimable, 2 * DEPOSIT, "Bob receives his deposit plus Alice's penalty");
 
         (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
@@ -324,8 +343,136 @@ contract MutualLiquidityLockTest is Test {
     }
 
     // ============================================================
+    //                  DYNAMIC EXIT PENALTY TESTS
+    // ============================================================
+
+    function test_DynamicPenaltyAtColdStart() public {
+        _activateBothParties();
+        // Alice has deposited 1 DEPOSIT total (activation)
+        uint256 penalty = mll.getExitPenalty(alice);
+        // penalty = 8000 - (8000-1500) * (1/7) = 8000 - 928 = 7072
+        assertGt(penalty, 7000, "Cold start penalty should be near P_max");
+        assertLt(penalty, EXIT_PENALTY_MAX, "But strictly below P_max since 1 deposit was made");
+    }
+
+    function test_DynamicPenaltyAtMaturity() public {
+        _activateBothParties();
+        // Deposit enough to reach s_target (7 deposits total with activation = 6 more)
+        for (uint i = 0; i < 6; i++) {
+            _warp(INTERVAL);
+            vm.prank(alice);
+            mll.deposit{value: DEPOSIT}();
+            vm.prank(bob);
+            mll.deposit{value: DEPOSIT}();
+        }
+        // Alice has deposited 7 DEPOSIT total (1 activation + 6 deposits) = target
+        uint256 penalty = mll.getExitPenalty(alice);
+        assertEq(penalty, EXIT_PENALTY_MIN, "Mature pool penalty should equal P_min");
+    }
+
+    function test_DynamicPenaltyAtMidpoint() public {
+        _activateBothParties();
+        // Deposit to roughly half of target
+        for (uint i = 0; i < 3; i++) {
+            _warp(INTERVAL);
+            vm.prank(alice);
+            mll.deposit{value: DEPOSIT}();
+            vm.prank(bob);
+            mll.deposit{value: DEPOSIT}();
+        }
+        // Alice has deposited 4 DEPOSIT total (1 + 3)
+        uint256 penalty = mll.getExitPenalty(alice);
+        // 8000 - 6500 * (4/7) = 8000 - 3714 = 4286
+        assertGt(penalty, EXIT_PENALTY_MIN, "Midpoint penalty > P_min");
+        assertLt(penalty, EXIT_PENALTY_MAX, "Midpoint penalty < P_max");
+    }
+
+    function test_DynamicPenaltyTracksPerParty() public {
+        _activateBothParties();
+        // Alice deposits more than Bob
+        for (uint i = 0; i < 5; i++) {
+            _warp(INTERVAL);
+            vm.prank(alice);
+            mll.deposit{value: DEPOSIT}();
+        }
+        // Alice: 6 deposits total. Bob: 1 deposit total (activation only)
+        uint256 alicePenalty = mll.getExitPenalty(alice);
+        uint256 bobPenalty = mll.getExitPenalty(bob);
+        assertLt(alicePenalty, bobPenalty, "Alice with more deposits should have lower penalty");
+    }
+
+    function test_DynamicPenaltyBeyondTarget() public {
+        _activateBothParties();
+        // Deposit well beyond target
+        for (uint i = 0; i < 10; i++) {
+            _warp(INTERVAL);
+            vm.prank(alice);
+            mll.deposit{value: DEPOSIT}();
+            vm.prank(bob);
+            mll.deposit{value: DEPOSIT}();
+        }
+        // Alice: 11 deposits, well past target of 7
+        uint256 penalty = mll.getExitPenalty(alice);
+        assertEq(penalty, EXIT_PENALTY_MIN, "Penalty stays at P_min beyond target");
+    }
+
+    function test_UnilateralExitMaturePoolLowPenalty() public {
+        _activateBothParties();
+        // Build up to maturity
+        for (uint i = 0; i < 6; i++) {
+            _warp(INTERVAL);
+            vm.prank(alice);
+            mll.deposit{value: DEPOSIT}();
+            vm.prank(bob);
+            mll.deposit{value: DEPOSIT}();
+        }
+
+        // Alice: 7 deposits = target. Penalty should be P_min = 15%
+        vm.prank(alice);
+        mll.initiateUnilateralExit();
+        _warp(30 days + 1);
+
+        // Bob deposits to keep compliant during countdown
+        vm.prank(bob);
+        mll.deposit{value: DEPOSIT}();
+
+        vm.prank(alice);
+        mll.executeUnilateralExit();
+
+        uint256 aliceClaimable = mll.claimable(alice);
+        // Alice's share = 7 DEPOSIT. Penalty = 15% of 7 = 1.05 ETH.
+        // Alice receives 85% of 7 = 5.95 ETH
+        assertGt(aliceClaimable, 7 * DEPOSIT * 8000 / 10000, "Mature exit: Alice retains >80%");
+        assertLt(aliceClaimable, 7 * DEPOSIT, "Alice still pays some penalty");
+    }
+
+    // ============================================================
     //                  DEAD MAN'S SWITCH TESTS
     // ============================================================
+
+    function test_ClaimAbandonedClearsPendingExit() public {
+        _activateBothParties();
+
+        // Alice initiates unilateral exit
+        vm.prank(alice);
+        mll.initiateUnilateralExit();
+
+        (, , bool active) = mll.pendingExit();
+        assertTrue(active, "Exit should be pending");
+
+        // Bob disappears for 91 days, Alice deposits to stay active
+        _warp(91 days);
+        vm.prank(alice);
+        mll.deposit{value: DEPOSIT}();
+
+        // Alice claims abandoned
+        vm.prank(alice);
+        mll.claimAbandoned();
+
+        // pendingExit should be cleared
+        (, , bool activeAfter) = mll.pendingExit();
+        assertFalse(activeAfter, "pendingExit should be cleared after abandonment");
+    }
 
     function test_ClaimAbandonedAfter90Days() public {
         _activateBothParties();
@@ -360,10 +507,8 @@ contract MutualLiquidityLockTest is Test {
     function test_ClaimAbandonedRequiresClaimerMoreActive() public {
         _activateBothParties();
 
-        // Both stop depositing for 91 days
         _warp(91 days);
 
-        // Alice tries to claim without depositing — should fail
         vm.prank(alice);
         vm.expectRevert("Claimer must be more active than counterparty");
         mll.claimAbandoned();
@@ -377,7 +522,6 @@ contract MutualLiquidityLockTest is Test {
         vm.prank(alice);
         mll.activate{value: DEPOSIT}();
 
-        // Bob never activates. Wait 7 days.
         _warp(7 days + 1);
 
         uint256 aliceBefore = alice.balance;
@@ -400,147 +544,6 @@ contract MutualLiquidityLockTest is Test {
         vm.prank(alice);
         vm.expectRevert("Too early to cancel");
         mll.cancelInactive();
-    }
-
-    // ============================================================
-    //                  RUSSIAN ROULETTE TESTS
-    // ============================================================
-
-    function test_RRBlockedDuringWarmup() public {
-        _activateBothParties();
-
-        vm.prank(alice);
-        vm.expectRevert();
-        mll.invokeRoulette{value: DEPOSIT}();
-    }
-
-    function test_RRCanBeInvoked() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        vm.prank(alice);
-        mll.invokeRoulette{value: DEPOSIT}();
-
-        (uint256 invCount, , , ) = mll.getRRState();
-        assertEq(invCount, 1);
-    }
-
-    function test_RRRequiresDeposit() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        vm.prank(alice);
-        vm.expectRevert("Must deposit to invoke RR");
-        mll.invokeRoulette();
-    }
-
-    function test_RRShareGateBlocksLowStakeInvoker() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        // Make Bob's share very large relative to Alice
-        for (uint i = 0; i < 3; i++) {
-            vm.prank(bob);
-            mll.deposit{value: DEPOSIT * 3}();
-        }
-
-        // Alice has much less than 35% of pool — should be blocked
-        vm.prank(alice);
-        vm.expectRevert();
-        mll.invokeRoulette{value: DEPOSIT}();
-    }
-
-    function test_RRCooldownPreventsImmediate() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        vm.prank(alice);
-        mll.invokeRoulette{value: DEPOSIT}();
-
-        (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
-        if (phase == MutualLiquidityLock.Phase.Active) {
-            vm.prank(bob);
-            vm.expectRevert();
-            mll.invokeRoulette{value: DEPOSIT}();
-        }
-    }
-
-    function test_RRCooldownExpiresAfter10Days() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        vm.prank(alice);
-        mll.invokeRoulette{value: DEPOSIT}();
-
-        (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
-        if (phase == MutualLiquidityLock.Phase.Active) {
-            _warp(10 days + 1);
-
-            vm.prank(bob);
-            mll.invokeRoulette{value: DEPOSIT}();
-
-            (uint256 invCount, , , ) = mll.getRRState();
-            assertEq(invCount, 2);
-        }
-    }
-
-    function test_RRCertainTriggerAtSixthInvocation() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        for (uint i = 0; i < 6; i++) {
-            (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
-            if (phase != MutualLiquidityLock.Phase.Active) break;
-
-            _warp(10 days + 1);
-            vm.prank(i % 2 == 0 ? alice : bob);
-            mll.invokeRoulette{value: DEPOSIT}();
-        }
-
-        (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
-        assertEq(uint256(phase), uint256(MutualLiquidityLock.Phase.Frozen));
-    }
-
-    function test_RRNonPartyCannotInvoke() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        address charlie = makeAddr("charlie");
-        vm.deal(charlie, 10 ether);
-        vm.prank(charlie);
-        vm.expectRevert(MutualLiquidityLock.NotParty.selector);
-        mll.invokeRoulette{value: DEPOSIT}();
-    }
-
-    // ============================================================
-    //                  FREEZE DURATION TESTS
-    // ============================================================
-
-    function test_FrozenFundsCanBeReleasedAfterDuration() public {
-        _activateBothParties();
-        _warpPastWarmup();
-
-        _forceFreeze();
-
-        (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
-        assertEq(uint256(phase), uint256(MutualLiquidityLock.Phase.Frozen));
-
-        // Cannot release before duration expires
-        vm.prank(alice);
-        vm.expectRevert();
-        mll.releaseFrozenFunds();
-
-        // Warp to after freeze duration (10 years)
-        _warp(3650 days + 1);
-
-        vm.prank(alice);
-        mll.releaseFrozenFunds();
-
-        (, , , phase) = mll.getPoolState();
-        assertEq(uint256(phase), uint256(MutualLiquidityLock.Phase.Exited));
-
-        assertGt(mll.claimable(alice), 0, "Alice has claimable funds");
-        assertGt(mll.claimable(bob), 0, "Bob has claimable funds");
     }
 
     // ============================================================
@@ -570,7 +573,7 @@ contract MutualLiquidityLockTest is Test {
     //                     INVARIANT TESTS
     // ============================================================
 
-    function test_PoolBalanceAlwaysGteShares() public {
+    function test_PoolBalanceEqualsShares() public {
         _activateBothParties();
 
         for (uint i = 0; i < 5; i++) {
@@ -587,7 +590,8 @@ contract MutualLiquidityLockTest is Test {
 
             (uint256 shareA, uint256 shareB, uint256 total, ) = mll.getPoolState();
             assertEq(total, shareA + shareB, "Total = shareA + shareB");
-            assertGe(address(mll).balance, total, "Contract balance >= total shares");
+            // With 100% transfer (no burn), balance should equal shares exactly
+            assertEq(address(mll).balance, total, "Contract balance == total shares (no burn)");
         }
     }
 
@@ -601,36 +605,5 @@ contract MutualLiquidityLockTest is Test {
 
         vm.prank(bob);
         mll.activate{value: DEPOSIT}();
-    }
-
-    function _warpPastWarmup() internal {
-        for (uint i = 0; i < 4; i++) {
-            _warp(INTERVAL);
-            vm.prank(alice);
-            mll.deposit{value: DEPOSIT}();
-            vm.prank(bob);
-            mll.deposit{value: DEPOSIT}();
-        }
-    }
-
-    function _warpPastDecay() internal {
-        _warpPastWarmup();
-        for (uint i = 0; i < DECAY_PERIODS; i++) {
-            _warp(INTERVAL);
-            vm.prank(alice);
-            mll.deposit{value: DEPOSIT}();
-            vm.prank(bob);
-            mll.deposit{value: DEPOSIT}();
-        }
-    }
-
-    function _forceFreeze() internal {
-        for (uint i = 0; i < 6; i++) {
-            (, , , MutualLiquidityLock.Phase phase) = mll.getPoolState();
-            if (phase != MutualLiquidityLock.Phase.Active) break;
-            _warp(10 days + 1);
-            vm.prank(i % 2 == 0 ? alice : bob);
-            mll.invokeRoulette{value: DEPOSIT}();
-        }
     }
 }

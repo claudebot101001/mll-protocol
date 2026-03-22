@@ -6,11 +6,10 @@ import "../src/MutualLiquidityLock.sol";
 
 /// @notice Deployment script for MLL Protocol
 /// @dev Usage:
-///   Testnet (short intervals for demo):
-///     forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --private-key $PK
+///   forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --private-key $PK
 ///
 ///   The deployer becomes partyA. Set PARTY_B env var to the counterparty address.
-///   Set TESTNET=true for short intervals (5 min deposit, 1 day freeze).
+///   Set TESTNET=true for short intervals.
 contract DeployMLL is Script {
     function run() external {
         address partyB = vm.envAddress("PARTY_B");
@@ -20,19 +19,26 @@ contract DeployMLL is Script {
         uint256 depositInterval;
         uint256 bleedRate;
         uint256 gracePeriods;
+        uint256 exitPenaltyMax;
+        uint256 exitPenaltyMin;
+        uint256 penaltyDecayTarget;
 
         if (isTestnet) {
-            // Testnet: 5-minute intervals, 0.01 ETH deposits, aggressive bleed for fast demo
             depositAmount = 0.01 ether;
             depositInterval = 5 minutes;
-            bleedRate = 100;     // 1%/day — 2x at launch = 2%/day, visible in minutes
+            bleedRate = 100;     // 1%/day
             gracePeriods = 1;
+            exitPenaltyMax = 8000;  // 80%
+            exitPenaltyMin = 1500;  // 15%
+            penaltyDecayTarget = 7; // 7 deposits to reach min
         } else {
-            // Production: 30-day intervals, 0.1 ETH deposits
             depositAmount = 0.1 ether;
             depositInterval = 30 days;
-            bleedRate = 50;      // 0.5%/day steady state
+            bleedRate = 50;      // 0.5%/day
             gracePeriods = 1;
+            exitPenaltyMax = 8000;
+            exitPenaltyMin = 1500;
+            penaltyDecayTarget = 7;
         }
 
         vm.startBroadcast();
@@ -43,7 +49,10 @@ contract DeployMLL is Script {
             depositAmount,
             depositInterval,
             bleedRate,
-            gracePeriods
+            gracePeriods,
+            exitPenaltyMax,
+            exitPenaltyMin,
+            penaltyDecayTarget
         );
 
         console.log("MLL deployed at:", address(mll));
@@ -52,6 +61,9 @@ contract DeployMLL is Script {
         console.log("Deposit amount:", depositAmount);
         console.log("Deposit interval:", depositInterval);
         console.log("Bleed rate (bps/day):", bleedRate);
+        console.log("Exit penalty max (bps):", exitPenaltyMax);
+        console.log("Exit penalty min (bps):", exitPenaltyMin);
+        console.log("Penalty decay target:", penaltyDecayTarget);
         console.log("Testnet mode:", isTestnet);
 
         vm.stopBroadcast();
