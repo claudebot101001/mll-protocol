@@ -37,6 +37,18 @@ Two parties lock capital into a shared pool with periodic heartbeat deposits. De
 | `MutualLiquidityLockTestable.sol` | 561 | Testable variant with shortened time constants (minutes vs days) |
 | `RussianRouletteTestable.sol` | 96 | Testable RR with 2-minute cooldown |
 
+## Deployment
+
+Production contract on **Base** (Ethereum L2), verified on [Sourcify](https://sourcify.dev):
+
+```
+0x9FB1e49a09572C10439Dc79CFEbFadb0441D7E7B
+```
+
+[View on Basescan](https://basescan.org/address/0x9FB1e49a09572C10439Dc79CFEbFadb0441D7E7B#code)
+
+Compiled with solc 0.8.33, `via_ir` optimization, 200 runs.
+
 ## Build & Test
 
 Requires [Foundry](https://book.getfoundry.sh/).
