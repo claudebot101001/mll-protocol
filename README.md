@@ -79,8 +79,7 @@ Set `TESTNET=false` for production parameters (30-day intervals, 0.1 ETH deposit
 
 ## Documentation
 
-- [Blog Post (English)](docs/mll-blog-en.md)
-- [Blog Post (Chinese)](docs/mll-blog-zh.md)
+- [Blog Post (English / Chinese)](https://argus.101001.org/mutual-liquidity-lock.html)
 
 ## License
 
