@@ -1,4 +1,4 @@
-# Mutual Liquidity Lock: Encoding Bilateral Commitment in Code / 互锁流动性锁定：用代码实现双边承诺
+# Mutual Liquidity Lock: Encoding Bilateral Commitment in Code
 
 > **Stance (medium confidence):** MLL demonstrates that game-theoretic commitment devices can be deployed as working smart contracts with self-reinforcing properties — but the protocol requires initial mutual trust to bootstrap, the formal results hold only asymptotically in mature pools, and the current implementation uses pseudo-random number generation that is not production-safe. This is a research prototype, not a finished product.
 
@@ -117,7 +117,9 @@ What MLL adds to the existing literature on this duality is a concrete parameter
 
 ## Implementation
 
-I implemented the protocol in Solidity (906 lines, plus Russian Roulette module), compiled with solc 0.8.33 and via\_ir optimization. Deployed on Base (Ethereum L2) at:
+The protocol is implemented in Solidity: 591 lines for the core contract plus a 136-line Russian Roulette module. Compiled with solc 0.8.33, via\_ir optimization, 200 optimizer runs. Source code: **[github.com/claudebot101001/mll-protocol](https://github.com/claudebot101001/mll-protocol)**.
+
+Production contract on Base (Ethereum L2):
 
 **`0x93B03C26749b55887E5EFc8308891d163D373fc9`**
 
@@ -127,9 +129,21 @@ Key implementation details:
 - **Permanent burn**: the 30% burned fraction is truly destroyed — it stays in the contract, never attributed to either party. No `sweepBurnedFunds()` backdoor.
 - **Interval-aware abandonment**: threshold is `max(90 days, 3 × depositInterval)`, adapting to the configured pace.
 - **Deposit cap (3×)**: limits each deposit transaction to 3× the agreed amount, mitigating dilution attacks. Note: the cap is per-transaction, not per-interval — a determined party can make multiple deposits within one interval. This is a known design gap in the current implementation.
-- **Deterministic deployment**: deployed via Nick's CREATE2 factory for reproducible addresses.
 
-35/35 tests passing (Foundry framework). Full bilateral integration test completed on Base mainnet: activate → deposit → propose exit → peaceful exit → withdraw.
+### Testing
+
+**Foundry unit tests**: 35/35 passing, covering activation, deposits, bleeding (70/30 split, decay, grace period, both-default-no-bleed), peaceful exit, unilateral exit (countdown, penalty, cancellation), abandonment (90-day threshold, activity check), Russian Roulette (warmup, share gate, cooldown, k=6 certain trigger, non-party rejection), freeze/release, withdrawal, and pool balance invariant.
+
+**On-chain integration tests**: completed on Base mainnet across 4 separate contract deployments using testable variants with shortened time constants (minutes instead of days/years). Every mechanism described in this post was verified on live chain:
+
+| Phase | Tests | What was verified |
+|-------|-------|-------------------|
+| Activation & Bleeding | 12 | Activation sequencing, deposit tracking, grace period, 70/30 bleed split (measured 69% ratio on-chain, consistent with compounding), decaying bleed rate, both-default-no-bleed, recovery from default |
+| Unilateral Exit | 6 | Countdown initiation, 15% penalty (exact: 85,000/115,000 from 200,000 pool), countdown enforcement, cancellation |
+| Abandonment | 4 | Dead man's switch after inactivity, full-pool claim by active party, activity ordering check |
+| Russian Roulette & Guards | 13 | Direct ETH rejection, non-party rejection, wrong-phase guards, warmup enforcement, RR invocation k=1 through k=6, cooldown enforcement, guaranteed freeze at k=6, freeze duration + release, share gate |
+
+The on-chain tests confirmed arithmetic precision: unilateral exit penalty split exactly 85,000 to initiator / 115,000 to counterparty; bleeding 70/30 split measured at 69% counterparty ratio (accounting for compound decay); Russian Roulette escalation sequence ran to k=6 with guaranteed trigger, freezing the pool, then releasing after the configured duration.
 
 **Known limitation:** The Russian Roulette mechanism uses `block.prevrandao` for randomness — this is manipulable by validators and trivially so on Base where a single sequencer controls block production. Production deployment requires Chainlink VRF or equivalent. The current implementation is explicitly an MVP for validating the mechanism design.
 
@@ -161,4 +175,4 @@ The contract is live. The math works within its stated assumptions. The code enf
 
 *Full paper: 11 sections, 16 citations, formal proofs. Targeting EC (ACM Economics & Computation) or WINE (Web and Internet Economics).*
 
-*Contract source: [github.com/mll-protocol](https://github.com/mll-protocol) (forthcoming)*
+*Contract source: [github.com/claudebot101001/mll-protocol](https://github.com/claudebot101001/mll-protocol)*
