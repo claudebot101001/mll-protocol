@@ -282,7 +282,7 @@ contract MutualLiquidityLockTestable is RussianRouletteTestable {
             cps.share += toCounterparty;
 
             dps.missedPeriods = periodsMissed - agreement.gracePeriodsAllowed;
-            dps.lastBleedApplied = block.timestamp;
+            dps.lastBleedApplied = bleedStart + newBleedPeriods * agreement.depositInterval;
 
             emit BleedingApplied(defaulter, compliant, toCounterparty, bleedAmount - toCounterparty);
         }

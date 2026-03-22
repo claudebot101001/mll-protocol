@@ -19,12 +19,11 @@ Two parties lock capital into a shared pool with periodic heartbeat deposits. De
 | Peaceful | Both agree | Each gets their share |
 | Unilateral | 30-day countdown | Initiator pays 15% penalty |
 | Freeze | Roulette triggered | Funds locked ~10 years |
-| Abandonment | Counterparty 90+ days inactive | Active party claims all |
+| Abandonment | Counterparty inactive past `max(90 days, 3·depositInterval)` with strictly older last deposit | Active party claims all |
 
 ## Key Properties
 
-- **Self-reinforcing**: cooperation threshold `delta* = d/(d + r*s)` decreases as pool grows
-- **Renegotiation-resistant**: in mature pools, the compliant party prefers ongoing bleed transfers over any peace deal
+- **Self-reinforcing**: cooperation threshold δ* decreases as pool grows — see [blog](https://argus.101001.org/mutual-liquidity-lock.html) for formal derivation (note: published δ* table assumes G=0; with default `gracePeriods=1`, the binding constraint is `δ ≥ [d/(d+Rs)]^{1/(G+1)}`, raising thresholds by 6–24 pp)
 - **Pull-based withdrawals**: all exit paths credit a `claimable` mapping — prevents DoS
 - **Cold-start decay**: initial bleed rate starts at 2x and linearly decays over 6 periods
 
@@ -48,6 +47,8 @@ Production contract on **Base** (Ethereum L2), verified on [Sourcify](https://so
 [View on Basescan](https://basescan.org/address/0x9FB1e49a09572C10439Dc79CFEbFadb0441D7E7B#code)
 
 Compiled with solc 0.8.33, `via_ir` optimization, 200 runs.
+
+> **Note**: The deployed contract predates a minor bugfix in this repository. The on-chain version sets `lastBleedApplied = block.timestamp` which loses sub-day fractional bleed time (~1.6–3% annual impact). The repository source uses the corrected `lastBleedApplied = bleedStart + newBleedDays * 1 days`, snapping to the last fully-processed day boundary. This is the only difference between deployed and source.
 
 ## Build & Test
 
@@ -75,8 +76,10 @@ Set `TESTNET=false` for production parameters (30-day intervals, 0.1 ETH deposit
 
 ## Known Limitations
 
-- **Pseudo-random RR**: uses `block.prevrandao` — manipulable by validators, especially on L2s with single sequencers. Production deployment requires Chainlink VRF.
+- **Pseudo-random RR**: uses `block.prevrandao` — manipulable by validators, especially on L2s with single sequencers. Production deployment requires Chainlink VRF or equivalent.
+- **RR callable during unilateral exit**: the 30-day exit countdown runs in `Active` phase, during which Russian Roulette remains invocable (up to 3 times with 10-day cooldowns, cumulative ~50% freeze probability). Unilateral exit is a penalty-based escape, not a guaranteed safety valve.
 - **Per-tx deposit cap**: the 3x cap is per-transaction, not per-interval. A party can make multiple deposits within one interval.
+- **Uncapped activation deposit**: `activate()` requires `msg.value >= depositAmount` with no upper bound, allowing asymmetric initial stakes.
 - **Cold-start fragility**: the protocol cannot bootstrap itself — initial cooperation requires external trust or incentive.
 
 ## Documentation

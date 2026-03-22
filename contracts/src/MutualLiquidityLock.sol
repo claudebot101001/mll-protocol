@@ -298,7 +298,7 @@ contract MutualLiquidityLock is RussianRoulette {
             cps.share += toCounterparty;
 
             dps.missedPeriods = periodsMissed - agreement.gracePeriodsAllowed;
-            dps.lastBleedApplied = block.timestamp;
+            dps.lastBleedApplied = bleedStart + newBleedDays * 1 days;
 
             emit BleedingApplied(defaulter, compliant, toCounterparty, bleedAmount - toCounterparty);
         }
