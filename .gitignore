@@ -8,6 +8,9 @@ contracts/lib/
 # Build artifacts
 *.abi
 *.bin
+contracts/broadcast/
+contracts/foundry.lock
+contracts/standard-json-input.json
 
 # Environment
 .env
