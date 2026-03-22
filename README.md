@@ -42,14 +42,12 @@ Two parties lock capital into a shared pool with periodic heartbeat deposits. De
 Production contract on **Base** (Ethereum L2), verified on [Sourcify](https://sourcify.dev):
 
 ```
-0x9FB1e49a09572C10439Dc79CFEbFadb0441D7E7B
+0xd25de1a0a1433ca3bad55ec3fb6b2488111649de
 ```
 
-[View on Basescan](https://basescan.org/address/0x9FB1e49a09572C10439Dc79CFEbFadb0441D7E7B#code)
+[View on Basescan](https://basescan.org/address/0xd25de1a0a1433ca3bad55ec3fb6b2488111649de#code)
 
-Compiled with solc 0.8.33, `via_ir` optimization, 200 runs.
-
-> **Note**: The deployed contract predates the simplification in this repository. The on-chain version includes Russian Roulette, 70/30 burn split, and constant 15% exit penalty. The repository source reflects the simplified protocol (dynamic penalty, 100% bleed transfer, no RR).
+Compiled with solc 0.8.33, `via_ir` optimization, 200 runs. Verified on Sourcify (exact match).
 
 ## Build & Test
 
